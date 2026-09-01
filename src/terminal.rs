@@ -1,4 +1,4 @@
-use std::io::{self, Stdout, stdout};
+use std::io::{self, Stdout, Write, stdout};
 
 use crossterm::{
     ExecutableCommand,
@@ -21,22 +21,30 @@ impl TerminalSession {
         enable_raw_mode().map_err(|error| contextual_error("failed to enable raw mode", error))?;
 
         let mut output = stdout();
-        if let Err(error) = output
-            .execute(EnterAlternateScreen)
-            .and_then(|output| output.execute(Hide))
-        {
-            let _ = disable_raw_mode();
-            return Err(contextual_error("failed to enter alternate screen", error).into());
+        if let Err(error) = output.execute(EnterAlternateScreen) {
+            return Err(initialization_error(
+                "failed to enter alternate screen",
+                error,
+                restore_output(&mut output),
+            ));
+        }
+        if let Err(error) = output.execute(Hide) {
+            return Err(initialization_error(
+                "failed to hide terminal cursor",
+                error,
+                restore_output(&mut output),
+            ));
         }
 
         let terminal = match Terminal::new(CrosstermBackend::new(output)) {
             Ok(terminal) => terminal,
             Err(error) => {
                 let mut output = stdout();
-                let _ = output.execute(Show);
-                let _ = output.execute(LeaveAlternateScreen);
-                let _ = disable_raw_mode();
-                return Err(contextual_error("failed to initialize terminal", error).into());
+                return Err(initialization_error(
+                    "failed to initialize terminal",
+                    error,
+                    restore_output(&mut output),
+                ));
             }
         };
 
@@ -55,25 +63,11 @@ impl TerminalSession {
             return Ok(());
         }
 
-        let mut first_error = None;
-        record_error(&mut first_error, disable_raw_mode());
-        record_error(
-            &mut first_error,
-            self.terminal.backend_mut().execute(Show).map(|_| ()),
-        );
-        record_error(
-            &mut first_error,
-            self.terminal
-                .backend_mut()
-                .execute(LeaveAlternateScreen)
-                .map(|_| ()),
-        );
+        let restoration_result = restore_output(self.terminal.backend_mut());
         self.restored = true;
 
-        match first_error {
-            Some(error) => Err(contextual_error("failed to restore terminal", error).into()),
-            None => Ok(()),
-        }
+        restoration_result
+            .map_err(|error| contextual_error("failed to restore terminal", error).into())
     }
 }
 
@@ -88,6 +82,35 @@ fn record_error(first_error: &mut Option<io::Error>, result: io::Result<()>) {
         && first_error.is_none()
     {
         *first_error = Some(error);
+    }
+}
+
+fn restore_output(output: &mut impl Write) -> io::Result<()> {
+    let mut first_error = None;
+    record_error(&mut first_error, output.execute(Show).map(|_| ()));
+    record_error(
+        &mut first_error,
+        output.execute(LeaveAlternateScreen).map(|_| ()),
+    );
+    record_error(&mut first_error, disable_raw_mode());
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn initialization_error(
+    context: &'static str,
+    source: io::Error,
+    restoration_result: io::Result<()>,
+) -> Box<dyn std::error::Error> {
+    let primary_error = contextual_error(context, source);
+    match restoration_result {
+        Ok(()) => primary_error.into(),
+        Err(restoration_error) => {
+            format!("{primary_error}; terminal restoration also failed: {restoration_error}").into()
+        }
     }
 }
 

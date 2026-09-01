@@ -21,6 +21,15 @@ pub struct InboxEntry {
 }
 
 impl InboxEntry {
+    #[cfg(test)]
+    pub(crate) fn test_file(name: &str) -> Self {
+        Self {
+            name: OsString::from(name),
+            path: PathBuf::from(name),
+            kind: EntryKind::File,
+        }
+    }
+
     pub fn is_directory(&self) -> bool {
         self.kind == EntryKind::Directory
     }
@@ -127,6 +136,15 @@ mod tests {
             downloads_path(std::ffi::OsStr::new("/home/someone")),
             PathBuf::from("/home/someone/Downloads")
         );
+    }
+
+    #[test]
+    fn empty_inbox_returns_an_empty_entry_list() {
+        let inbox = TestDirectory::new();
+
+        let entries = scan_inbox(&inbox.0).expect("empty inbox should be scanned");
+
+        assert!(entries.is_empty());
     }
 
     #[test]
