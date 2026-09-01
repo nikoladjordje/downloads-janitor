@@ -45,18 +45,19 @@ impl InboxEntry {
 }
 
 pub fn scan_downloads() -> Result<Vec<InboxEntry>> {
-    let home = env::var_os("HOME").ok_or_else(|| {
+    let home = env::var_os("HOME");
+    scan_inbox(&downloads_path(home.as_deref())?)
+}
+
+fn downloads_path(home: Option<&OsStr>) -> io::Result<PathBuf> {
+    let home = home.filter(|path| !path.is_empty()).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "cannot locate Downloads inbox because $HOME is not set",
+            "cannot locate Downloads inbox because $HOME is not set or is empty",
         )
     })?;
 
-    scan_inbox(&downloads_path(&home))
-}
-
-fn downloads_path(home: &OsStr) -> PathBuf {
-    PathBuf::from(home).join("Downloads")
+    Ok(PathBuf::from(home).join("Downloads"))
 }
 
 fn scan_inbox(path: &Path) -> Result<Vec<InboxEntry>> {
@@ -73,10 +74,12 @@ fn scan_inbox(path: &Path) -> Result<Vec<InboxEntry>> {
     let mut entries = directory
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
-            let file_type = entry.file_type().ok()?;
-            let kind = if file_type.is_dir() {
+            // `metadata` follows symlinks, so links are classified by their targets
+            // while the entry's own name and path remain visible in the inbox.
+            let metadata = fs::metadata(entry.path()).ok()?;
+            let kind = if metadata.is_dir() {
                 EntryKind::Directory
-            } else if file_type.is_file() {
+            } else if metadata.is_file() {
                 EntryKind::File
             } else {
                 return None;
@@ -131,10 +134,41 @@ mod tests {
     }
 
     #[test]
-    fn downloads_path_is_resolved_relative_to_home() {
+    fn unset_home_is_rejected() {
+        let error = downloads_path(None).expect_err("unset home should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("$HOME"));
+    }
+
+    #[test]
+    fn empty_home_is_rejected() {
+        let error =
+            downloads_path(Some(std::ffi::OsStr::new(""))).expect_err("empty home should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn downloads_path_is_resolved_relative_to_valid_home() {
         assert_eq!(
-            downloads_path(std::ffi::OsStr::new("/home/someone")),
+            downloads_path(Some(std::ffi::OsStr::new("/home/someone")))
+                .expect("valid home should resolve"),
             PathBuf::from("/home/someone/Downloads")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn downloads_path_supports_non_unicode_home() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let home = OsString::from_vec(b"/home/non-unicode-\xff".to_vec());
+
+        assert_eq!(
+            downloads_path(Some(&home)).expect("non-Unicode home should resolve"),
+            PathBuf::from(&home).join("Downloads")
         );
     }
 
@@ -189,6 +223,48 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, filename);
         assert!(entries[0].display_name().starts_with("not-unicode-"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_classifies_symlinks_by_their_targets_and_skips_broken_links() {
+        use std::os::unix::fs::symlink;
+
+        let inbox = TestDirectory::new();
+        let targets = TestDirectory::new();
+        let target_file = targets.0.join("target.txt");
+        let target_directory = targets.0.join("target-dir");
+        File::create(&target_file).expect("target file should be created");
+        fs::create_dir(&target_directory).expect("target directory should be created");
+        File::create(target_directory.join("nested.txt"))
+            .expect("nested target file should be created");
+        symlink(&target_file, inbox.0.join("linked-file")).expect("file symlink should be created");
+        symlink(&target_directory, inbox.0.join("linked-directory"))
+            .expect("directory symlink should be created");
+        symlink(targets.0.join("missing"), inbox.0.join("broken-link"))
+            .expect("broken symlink should be created");
+
+        let entries = scan_inbox(&inbox.0).expect("test inbox should be scanned");
+        let actual = entries
+            .iter()
+            .map(|entry| (entry.display_name(), entry.kind, entry.path.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    "linked-directory/".to_owned(),
+                    EntryKind::Directory,
+                    inbox.0.join("linked-directory"),
+                ),
+                (
+                    "linked-file".to_owned(),
+                    EntryKind::File,
+                    inbox.0.join("linked-file"),
+                ),
+            ]
+        );
     }
 
     #[test]

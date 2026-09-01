@@ -40,6 +40,9 @@ Selection stops at the first and final entries; it does not wrap around.
 
 Milestone 1 is strictly read-only. It scans only the immediate entries in
 `$HOME/Downloads`: subdirectories are shown but never traversed.
+Symlinks to files and directories are displayed according to their targets;
+directory symlinks are not traversed. Broken links and special filesystem
+entries are skipped.
 
 It does not move, rename, delete, preview, categorize, or otherwise organize
 files. Those organization features are reserved for later milestones. It also
