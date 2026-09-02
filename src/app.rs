@@ -1,21 +1,44 @@
-use std::io;
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
-use crate::{Result, inbox::InboxEntry, terminal::TerminalSession, ui};
+use crate::{
+    Result,
+    destination::{DestinationBrowser, DestinationEntry},
+    inbox::InboxEntry,
+    proposed_move::ProposedMove,
+    terminal::TerminalSession,
+    ui,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Screen {
+    Inbox,
+    DestinationBrowser,
+    MovePreview,
+}
 
 pub struct App {
     entries: Vec<InboxEntry>,
     selection: Selection,
+    screen: Screen,
+    destination_browser: DestinationBrowser,
+    proposed_move: Option<ProposedMove>,
     should_quit: bool,
 }
 
 impl App {
-    pub fn new(entries: Vec<InboxEntry>) -> Self {
+    pub fn new(entries: Vec<InboxEntry>, home: PathBuf) -> Self {
         let selection = Selection::new(entries.len());
         Self {
             entries,
             selection,
+            screen: Screen::Inbox,
+            destination_browser: DestinationBrowser::new(home),
+            proposed_move: None,
             should_quit: false,
         }
     }
@@ -26,6 +49,30 @@ impl App {
 
     pub fn selected(&self) -> Option<usize> {
         self.selection.index()
+    }
+
+    pub fn screen(&self) -> Screen {
+        self.screen
+    }
+
+    pub fn destination(&self) -> Option<&Path> {
+        (self.screen != Screen::Inbox).then_some(self.destination_browser.current())
+    }
+
+    pub fn destination_entries(&self) -> &[DestinationEntry] {
+        self.destination_browser.entries()
+    }
+
+    pub fn destination_selected(&self) -> Option<usize> {
+        self.destination_browser.selected()
+    }
+
+    pub fn destination_error(&self) -> Option<&str> {
+        self.destination_browser.error()
+    }
+
+    pub fn proposed_move(&self) -> Option<&ProposedMove> {
+        self.proposed_move.as_ref()
     }
 
     pub fn run(mut self, terminal: &mut TerminalSession) -> Result<()> {
@@ -42,16 +89,52 @@ impl App {
         Ok(())
     }
 
-    fn handle_event(&mut self, event: Event) {
+    pub(crate) fn handle_event(&mut self, event: Event) {
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
         {
             match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
-                KeyCode::Char('j') | KeyCode::Down => {
+                KeyCode::Enter if self.screen == Screen::Inbox && self.selected().is_some() => {
+                    self.destination_browser.refresh();
+                    self.screen = Screen::DestinationBrowser;
+                }
+                KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right
+                    if self.screen == Screen::DestinationBrowser =>
+                {
+                    self.destination_browser.enter_selected();
+                }
+                KeyCode::Char('d') if self.screen == Screen::DestinationBrowser => {
+                    self.proposed_move = self.selected().and_then(|index| {
+                        ProposedMove::new(&self.entries[index], self.destination_browser.current())
+                    });
+                    if self.proposed_move.is_some() {
+                        self.screen = Screen::MovePreview;
+                    }
+                }
+                KeyCode::Esc if self.screen == Screen::DestinationBrowser => {
+                    self.screen = Screen::Inbox;
+                }
+                KeyCode::Esc if self.screen == Screen::MovePreview => {
+                    self.screen = Screen::DestinationBrowser;
+                }
+                KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::DestinationBrowser => {
+                    self.destination_browser.move_down();
+                }
+                KeyCode::Char('k') | KeyCode::Up if self.screen == Screen::DestinationBrowser => {
+                    self.destination_browser.move_up();
+                }
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace
+                    if self.screen == Screen::DestinationBrowser =>
+                {
+                    self.destination_browser.enter_parent();
+                }
+                KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::Inbox => {
                     self.selection.move_down(self.entries.len());
                 }
-                KeyCode::Char('k') | KeyCode::Up => self.selection.move_up(),
+                KeyCode::Char('k') | KeyCode::Up if self.screen == Screen::Inbox => {
+                    self.selection.move_up();
+                }
                 _ => {}
             }
         }
@@ -93,23 +176,28 @@ fn contextual_io_error(context: &'static str, source: io::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     use crate::inbox::InboxEntry;
 
-    use super::{App, Selection};
+    use crate::proposed_move::{ProposedEntryType, ProposedMove};
+
+    use super::{App, Screen, Selection};
 
     fn app_with_entries(entry_count: usize) -> App {
         App::new(
             (0..entry_count)
                 .map(|index| InboxEntry::test_file(&format!("entry-{index}")))
                 .collect(),
+            "/home/tester".into(),
         )
     }
 
     #[test]
     fn q_requests_quit() {
-        let mut app = App::new(Vec::new());
+        let mut app = App::new(Vec::new(), "/home/tester".into());
 
         app.handle_event(Event::Key(KeyEvent::new(
             KeyCode::Char('q'),
@@ -121,7 +209,7 @@ mod tests {
 
     #[test]
     fn other_events_do_not_request_quit() {
-        let mut app = App::new(Vec::new());
+        let mut app = App::new(Vec::new(), "/home/tester".into());
 
         app.handle_event(Event::Key(KeyEvent::new(
             KeyCode::Char('j'),
@@ -210,11 +298,113 @@ mod tests {
 
     #[test]
     fn non_key_events_leave_state_unchanged() {
-        let mut app = App::new(Vec::new());
+        let mut app = App::new(Vec::new(), "/home/tester".into());
 
         app.handle_event(Event::Resize(120, 40));
 
         assert_eq!(app.selected(), None);
         assert!(!app.should_quit);
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn enter_and_escape_traverse_screens_without_losing_inbox_selection() {
+        let mut app = app_with_entries(2);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::DestinationBrowser);
+        assert_eq!(
+            app.destination(),
+            Some(std::path::Path::new("/home/tester"))
+        );
+
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.screen(), Screen::MovePreview);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen(), Screen::DestinationBrowser);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert_eq!(app.selected(), Some(1));
+    }
+
+    #[test]
+    fn empty_inbox_cannot_advance() {
+        let mut app = App::new(Vec::new(), "/home/tester".into());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::Inbox);
+    }
+
+    #[test]
+    fn q_requests_quit_from_every_screen() {
+        for initial_screen in [
+            Screen::Inbox,
+            Screen::DestinationBrowser,
+            Screen::MovePreview,
+        ] {
+            let mut app = app_with_entries(1);
+            app.screen = initial_screen;
+            press(&mut app, KeyCode::Char('q'));
+            assert!(app.should_quit, "quit from {initial_screen:?}");
+        }
+    }
+
+    #[test]
+    fn proposed_moves_preserve_basename_and_symlink_identity() {
+        let entries = [
+            InboxEntry::test_file("file.txt"),
+            InboxEntry::test_directory("folder"),
+            InboxEntry::test_symlink("link", crate::inbox::EntryKind::Directory),
+        ];
+
+        for (entry, expected_type) in entries.iter().zip([
+            ProposedEntryType::File,
+            ProposedEntryType::Directory,
+            ProposedEntryType::Symlink,
+        ]) {
+            let proposal = ProposedMove::new(entry, std::path::Path::new("/destination"))
+                .expect("test entry has a basename");
+            assert_eq!(proposal.entry_type(), expected_type);
+            assert_eq!(proposal.source(), entry.path());
+            assert_eq!(proposal.destination(), std::path::Path::new("/destination"));
+            assert_eq!(
+                proposal.resulting_path(),
+                std::path::Path::new("/destination").join(entry.path().file_name().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn reopening_preview_revalidates_the_source() {
+        let root = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-validation-{}",
+            std::process::id()
+        ));
+        let source = root.join("source.txt");
+        let destination = root.join("destination");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::File::create(&source).unwrap();
+        let entry = InboxEntry::test_entry(source.clone(), crate::inbox::EntryKind::File, false);
+        let mut app = App::new(vec![entry], root.clone());
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.proposed_move().unwrap().is_valid());
+
+        press(&mut app, KeyCode::Esc);
+        fs::remove_file(&source).unwrap();
+        press(&mut app, KeyCode::Char('d'));
+
+        assert!(
+            app.proposed_move()
+                .unwrap()
+                .failures()
+                .contains(&crate::proposed_move::ValidationFailure::SourceMissing)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

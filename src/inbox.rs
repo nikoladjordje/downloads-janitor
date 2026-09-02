@@ -18,15 +18,47 @@ pub struct InboxEntry {
     name: OsString,
     path: PathBuf,
     kind: EntryKind,
+    is_symlink: bool,
 }
 
 impl InboxEntry {
+    #[cfg(test)]
+    pub(crate) fn test_entry(path: PathBuf, kind: EntryKind, is_symlink: bool) -> Self {
+        Self {
+            name: path.file_name().unwrap().to_os_string(),
+            path,
+            kind,
+            is_symlink,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_file(name: &str) -> Self {
         Self {
             name: OsString::from(name),
             path: PathBuf::from(name),
             kind: EntryKind::File,
+            is_symlink: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_directory(name: &str) -> Self {
+        Self {
+            name: OsString::from(name),
+            path: PathBuf::from(name),
+            kind: EntryKind::Directory,
+            is_symlink: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_symlink(name: &str, kind: EntryKind) -> Self {
+        Self {
+            name: OsString::from(name),
+            path: PathBuf::from(name),
+            kind,
+            is_symlink: true,
         }
     }
 
@@ -42,11 +74,32 @@ impl InboxEntry {
         }
         name
     }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.is_symlink
+    }
+
+    pub fn kind(&self) -> EntryKind {
+        self.kind
+    }
 }
 
 pub fn scan_downloads() -> Result<Vec<InboxEntry>> {
     let home = env::var_os("HOME");
     scan_inbox(&downloads_path(home.as_deref())?)
+}
+
+pub fn home_directory() -> Result<PathBuf> {
+    let home = env::var_os("HOME");
+    let downloads = downloads_path(home.as_deref())?;
+    Ok(downloads
+        .parent()
+        .expect("Downloads path always has a parent")
+        .to_path_buf())
 }
 
 fn downloads_path(home: Option<&OsStr>) -> io::Result<PathBuf> {
@@ -74,6 +127,7 @@ fn scan_inbox(path: &Path) -> Result<Vec<InboxEntry>> {
     let mut entries = directory
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
+            let is_symlink = entry.file_type().ok()?.is_symlink();
             // `metadata` follows symlinks, so links are classified by their targets
             // while the entry's own name and path remain visible in the inbox.
             let metadata = fs::metadata(entry.path()).ok()?;
@@ -89,6 +143,7 @@ fn scan_inbox(path: &Path) -> Result<Vec<InboxEntry>> {
                 name: entry.file_name(),
                 path: entry.path(),
                 kind,
+                is_symlink,
             })
         })
         .collect::<Vec<_>>();
@@ -247,7 +302,14 @@ mod tests {
         let entries = scan_inbox(&inbox.0).expect("test inbox should be scanned");
         let actual = entries
             .iter()
-            .map(|entry| (entry.display_name(), entry.kind, entry.path.clone()))
+            .map(|entry| {
+                (
+                    entry.display_name(),
+                    entry.kind,
+                    entry.is_symlink,
+                    entry.path.clone(),
+                )
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -256,11 +318,13 @@ mod tests {
                 (
                     "linked-directory/".to_owned(),
                     EntryKind::Directory,
+                    true,
                     inbox.0.join("linked-directory"),
                 ),
                 (
                     "linked-file".to_owned(),
                     EntryKind::File,
+                    true,
                     inbox.0.join("linked-file"),
                 ),
             ]

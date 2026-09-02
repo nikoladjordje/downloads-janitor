@@ -1,5 +1,7 @@
 mod app;
+mod destination;
 mod inbox;
+mod proposed_move;
 mod terminal;
 mod ui;
 
@@ -12,8 +14,9 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 fn main() -> Result<()> {
     let mut terminal = TerminalSession::start()?;
-    let application_result =
-        inbox::scan_downloads().and_then(|entries| App::new(entries).run(&mut terminal));
+    let application_result = inbox::home_directory().and_then(|home| {
+        inbox::scan_downloads().and_then(|entries| App::new(entries, home).run(&mut terminal))
+    });
     let restoration_result = terminal.restore();
 
     finish(application_result, restoration_result)
