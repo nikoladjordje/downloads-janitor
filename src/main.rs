@@ -1,6 +1,7 @@
 mod app;
 mod destination;
 mod inbox;
+mod move_execution;
 mod proposed_move;
 mod terminal;
 mod ui;

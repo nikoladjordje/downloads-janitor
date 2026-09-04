@@ -113,7 +113,7 @@ fn downloads_path(home: Option<&OsStr>) -> io::Result<PathBuf> {
     Ok(PathBuf::from(home).join("Downloads"))
 }
 
-fn scan_inbox(path: &Path) -> Result<Vec<InboxEntry>> {
+pub(crate) fn scan_inbox(path: &Path) -> Result<Vec<InboxEntry>> {
     let directory = fs::read_dir(path).map_err(|error| {
         io::Error::new(
             error.kind(),

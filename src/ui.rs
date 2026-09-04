@@ -16,6 +16,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::Inbox => render_inbox(frame, app),
         Screen::DestinationBrowser => render_destination(frame, app),
         Screen::MovePreview => render_preview(frame, app),
+        Screen::Confirmation => render_confirmation(frame, app),
     }
 }
 
@@ -29,8 +30,16 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
         ])
         .split(frame.area());
 
+    let notice = app
+        .notice()
+        .map(|notice| format!("    {notice}"))
+        .unwrap_or_default();
     frame.render_widget(
-        Paragraph::new(format!("~/Downloads    {} entries", app.entries().len())).block(
+        Paragraph::new(format!(
+            "~/Downloads    {} entries{notice}",
+            app.entries().len()
+        ))
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title("Downloads Janitor"),
@@ -160,9 +169,50 @@ fn render_preview(frame: &mut Frame<'_>, app: &App) {
         );
     }
     lines.push(Line::default());
-    lines.push(Line::from("Esc Back    q Quit"));
+    lines.push(Line::from(if proposal.is_valid() {
+        "m Confirm    Esc Back    q Quit"
+    } else {
+        "Esc Back    q Quit"
+    }));
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Move Preview")),
+        frame.area(),
+    );
+}
+
+fn render_confirmation(frame: &mut Frame<'_>, app: &App) {
+    let proposal = app
+        .proposed_move()
+        .expect("confirmation screen always has a proposed move");
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Type: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{:?}", proposal.entry_type())),
+        ]),
+        Line::from(vec![
+            Span::styled("From: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(proposal.source().to_string_lossy()),
+        ]),
+        Line::from(vec![
+            Span::styled("To:   ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(proposal.resulting_path().to_string_lossy()),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "Warning: executing this move will change the filesystem",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    if let Some(error) = app.move_error() {
+        lines.push(Line::from(Span::styled(
+            format!("Move failed: {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from("Enter Execute    Esc Back    q Quit"));
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Confirmation")),
         frame.area(),
     );
 }
@@ -288,6 +338,7 @@ mod tests {
         assert!(valid.contains(source.to_string_lossy().as_ref()));
         assert!(valid.contains(destination.join("source.txt").to_string_lossy().as_ref()));
         assert!(valid.contains("Esc Back    q Quit"));
+        assert!(valid.contains("m Confirm"));
         assert!(!valid.contains("d Choose"));
 
         press(&mut app, KeyCode::Esc);
@@ -297,5 +348,31 @@ mod tests {
         assert!(invalid.contains("Invalid proposal"));
         assert!(invalid.contains("source no longer exists"));
         assert!(!invalid.contains("no files will be changed"));
+        assert!(!invalid.contains("m Confirm"));
+    }
+
+    #[test]
+    fn confirmation_renders_exact_operation_warning_and_controls() {
+        let root = TestDirectory::new();
+        let destination = root.0.join("destination");
+        let source = root.0.join("source.txt");
+        fs::create_dir(&destination).unwrap();
+        fs::File::create(&source).unwrap();
+        let entry = InboxEntry::test_entry(source.clone(), EntryKind::File, false);
+        let mut app = App::new(vec![entry], root.0.clone());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('m'));
+
+        let output = rendered(&app, 100, 14);
+
+        assert!(output.contains("Confirmation"));
+        assert!(output.contains("Type: File"));
+        assert!(output.contains(source.to_string_lossy().as_ref()));
+        assert!(output.contains(destination.join("source.txt").to_string_lossy().as_ref()));
+        assert!(output.contains("will change the filesystem"));
+        assert!(output.contains("Enter Execute    Esc Back    q Quit"));
+        assert!(!output.contains("m Confirm"));
     }
 }

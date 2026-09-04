@@ -2,8 +2,8 @@
 
 Downloads Janitor is a keyboard-driven Linux terminal application for reviewing
 entries in `~/Downloads` and previewing where one entry could be placed. The
-Milestone 2 workflow is strictly read-only: it never moves, renames, deletes,
-queues, or persists anything.
+currently implemented Milestone 2 workflow is strictly read-only: it never
+moves, renames, deletes, queues, or persists anything.
 
 ## Requirements
 
@@ -110,6 +110,59 @@ Execution, confirmation, collision resolution, renaming, queues, configuration,
 persistence, favorites, hidden-directory browsing, directory-symlink traversal,
 undo/history, organization rules, filesystem watching, and background work are
 deliberately deferred.
+
+## Roadmap
+
+Milestones 1 and 2 are implemented. Milestone 3 has an agreed specification but
+is not implemented yet. Milestones 4 through 6 are proposed directions whose
+scope will be refined before implementation.
+
+### Milestone 3 — Safe Move Execution
+
+Milestone 3 will turn one valid Proposed Move into an explicitly authorized
+filesystem change. A valid Preview will open a separate Confirmation screen
+showing the exact source and resulting paths. Pressing `Enter` there will start
+one Move Attempt after repeating validation and verifying that the source is
+still the same Inbox Entry the user reviewed.
+
+Execution will use Linux's atomic no-replace rename behavior. Regular files,
+non-empty directories, and Symlink Entries will be supported when source and
+Destination are on the same filesystem. Existing paths will never be
+overwritten, and cross-filesystem copy-then-delete behavior will remain out of
+scope.
+
+A failed Move Attempt will remain recoverable on Confirmation and may be
+retried using fresh filesystem state. A Completed Move will return to a
+rescanned Inbox, select the next logical entry, and show a success notice. If
+the move succeeds but refreshing the Inbox fails, the application will report
+both outcomes accurately rather than claiming that the move failed.
+
+The complete planned behavior is defined in
+[the Milestone 3 specification](./Downloads%20Janitor%20%E2%80%94%20Milestone%203%20Specification.md).
+
+### Milestone 4 — Efficient Inbox Processing
+
+The proposed fourth milestone will make repeated review faster after safe
+single-move execution has been proven. Likely work includes a smoother
+process-the-Inbox loop and explicit rename, ignore, and delete or trash
+decisions. Exact action semantics, safety rules, and whether ignored entries
+persist have not been decided.
+
+### Milestone 5 — Configuration and Rules
+
+The proposed fifth milestone will introduce user-controlled configuration,
+favorite Destinations, and deterministic organization rules. Rules will remain
+explicit and understandable rather than using AI classification. Configuration
+format, rule precedence, matching behavior, and persistence are still to be
+designed.
+
+### Milestone 6 — History, Undo, and Release Hardening
+
+The proposed sixth milestone will focus on trustworthy recovery and a polished
+release. Likely work includes operation history, undo where filesystem
+semantics permit it, packaging, installation guidance, broader acceptance
+testing, and release hardening. The guarantees and limits of undo require a
+separate design before this scope is considered committed.
 
 ## Verification
 
