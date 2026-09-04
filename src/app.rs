@@ -22,7 +22,6 @@ pub enum Screen {
     Inbox,
     DestinationBrowser,
     MovePreview,
-    Confirmation,
 }
 
 pub struct App {
@@ -36,6 +35,7 @@ pub struct App {
     move_error: Option<String>,
     inbox_path: PathBuf,
     inbox_scanner: InboxScanner,
+    pending_g: bool,
     should_quit: bool,
 }
 
@@ -62,6 +62,7 @@ impl App {
             move_error: None,
             inbox_path,
             inbox_scanner,
+            pending_g: false,
             should_quit: false,
         }
     }
@@ -125,6 +126,9 @@ impl App {
             && key.kind == KeyEventKind::Press
         {
             self.notice = None;
+            if key.code != KeyCode::Char('g') {
+                self.pending_g = false;
+            }
             match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Enter if self.screen == Screen::Inbox && self.selected().is_some() => {
@@ -148,6 +152,9 @@ impl App {
                     self.screen = Screen::Inbox;
                 }
                 KeyCode::Esc if self.screen == Screen::MovePreview => {
+                    if self.move_error.is_some() {
+                        self.return_to_refreshed_preview();
+                    }
                     self.screen = Screen::DestinationBrowser;
                 }
                 KeyCode::Char('m')
@@ -157,19 +164,20 @@ impl App {
                             .as_ref()
                             .is_some_and(ProposedMove::is_valid) =>
                 {
-                    let identity = self
-                        .proposed_move
-                        .as_ref()
-                        .and_then(|proposal| SourceIdentity::capture(proposal).ok());
-                    if let Some(identity) = identity {
-                        self.source_identity = Some(identity);
-                        self.move_error = None;
-                        self.screen = Screen::Confirmation;
+                    self.move_error = None;
+                    if self.source_identity.is_none() {
+                        match self.proposed_move.as_ref().map(SourceIdentity::capture) {
+                            Some(Ok(identity)) => self.source_identity = Some(identity),
+                            Some(Err(error)) => self.move_error = Some(error.to_string()),
+                            None => {
+                                self.move_error =
+                                    Some("the reviewed move is unavailable".to_owned());
+                            }
+                        }
                     }
-                }
-                KeyCode::Enter if self.screen == Screen::Confirmation => self.attempt_move(),
-                KeyCode::Esc if self.screen == Screen::Confirmation => {
-                    self.return_to_refreshed_preview();
+                    if self.source_identity.is_some() {
+                        self.attempt_move();
+                    }
                 }
                 KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::DestinationBrowser => {
                     self.destination_browser.move_down();
@@ -187,6 +195,28 @@ impl App {
                 }
                 KeyCode::Char('k') | KeyCode::Up if self.screen == Screen::Inbox => {
                     self.selection.move_up();
+                }
+                KeyCode::Char('g')
+                    if matches!(self.screen, Screen::Inbox | Screen::DestinationBrowser) =>
+                {
+                    if self.pending_g {
+                        match self.screen {
+                            Screen::Inbox => self.selection.move_to_first(self.entries.len()),
+                            Screen::DestinationBrowser => {
+                                self.destination_browser.move_to_first();
+                            }
+                            Screen::MovePreview => {}
+                        }
+                        self.pending_g = false;
+                    } else {
+                        self.pending_g = true;
+                    }
+                }
+                KeyCode::Char('G') if self.screen == Screen::Inbox => {
+                    self.selection.move_to_last(self.entries.len());
+                }
+                KeyCode::Char('G') if self.screen == Screen::DestinationBrowser => {
+                    self.destination_browser.move_to_last();
                 }
                 _ => {}
             }
@@ -240,7 +270,6 @@ impl App {
         });
         self.source_identity = None;
         self.move_error = None;
-        self.screen = Screen::MovePreview;
     }
 }
 
@@ -278,6 +307,14 @@ impl Selection {
         } else {
             Some(former_index.min(entry_count - 1))
         };
+    }
+
+    fn move_to_first(&mut self, entry_count: usize) {
+        self.index = (entry_count > 0).then_some(0);
+    }
+
+    fn move_to_last(&mut self, entry_count: usize) {
+        self.index = entry_count.checked_sub(1);
     }
 }
 
@@ -408,6 +445,59 @@ mod tests {
     }
 
     #[test]
+    fn vim_jumps_handle_empty_single_and_long_inbox_lists() {
+        let mut empty = app_with_entries(0);
+        press(&mut empty, KeyCode::Char('g'));
+        press(&mut empty, KeyCode::Char('g'));
+        press(&mut empty, KeyCode::Char('G'));
+        assert_eq!(empty.selected(), None);
+
+        let mut single = app_with_entries(1);
+        press(&mut single, KeyCode::Char('G'));
+        press(&mut single, KeyCode::Char('g'));
+        press(&mut single, KeyCode::Char('g'));
+        assert_eq!(single.selected(), Some(0));
+
+        let mut long = app_with_entries(20);
+        press(&mut long, KeyCode::Char('G'));
+        assert_eq!(long.selected(), Some(19));
+        press(&mut long, KeyCode::Char('g'));
+        assert_eq!(long.selected(), Some(19));
+        press(&mut long, KeyCode::Char('g'));
+        assert_eq!(long.selected(), Some(0));
+    }
+
+    #[test]
+    fn vim_jumps_work_in_destination_browser_and_sequences_are_cancelled() {
+        let root = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-vim-jumps-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        for index in 0..12 {
+            fs::create_dir(root.join(format!("directory-{index:02}"))).unwrap();
+        }
+        let mut app = app_with_entries(2);
+        app.destination_browser = crate::destination::DestinationBrowser::new(root.clone());
+
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.destination_selected(), Some(0));
+
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.destination_selected(), Some(11));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.destination_selected(), Some(11));
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.destination_selected(), Some(0));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn non_key_events_leave_state_unchanged() {
         let mut app = App::new(Vec::new(), "/home/tester".into());
 
@@ -454,7 +544,6 @@ mod tests {
             Screen::Inbox,
             Screen::DestinationBrowser,
             Screen::MovePreview,
-            Screen::Confirmation,
         ] {
             let mut app = app_with_entries(1);
             app.screen = initial_screen;
@@ -521,9 +610,9 @@ mod tests {
     }
 
     #[test]
-    fn valid_preview_opens_confirmation_and_back_preserves_proposal() {
+    fn valid_preview_executes_directly() {
         let root = std::env::temp_dir().join(format!(
-            "downloads-janitor-app-confirmation-{}",
+            "downloads-janitor-app-direct-move-{}",
             std::process::id()
         ));
         let source = root.join("source.txt");
@@ -537,26 +626,15 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
-        let source = app.proposed_move().unwrap().source().to_path_buf();
         let resulting_path = app.proposed_move().unwrap().resulting_path().to_path_buf();
-        let entry_type = app.proposed_move().unwrap().entry_type();
         press(&mut app, KeyCode::Char('m'));
-        assert_eq!(app.screen(), Screen::Confirmation);
-
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.screen(), Screen::MovePreview);
-        assert_eq!(app.proposed_move().unwrap().source(), source);
-        assert_eq!(
-            app.proposed_move().unwrap().resulting_path(),
-            resulting_path
-        );
-        assert_eq!(app.proposed_move().unwrap().entry_type(), entry_type);
-        assert!(fs::symlink_metadata(source).is_ok());
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert!(fs::symlink_metadata(resulting_path).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn invalid_preview_refuses_confirmation() {
+    fn invalid_preview_refuses_move() {
         let mut app = app_with_entries(1);
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
@@ -583,7 +661,6 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('m'));
-        press(&mut app, KeyCode::Enter);
 
         assert_eq!(app.screen(), Screen::Inbox);
         assert_eq!(app.entries().len(), 1);
@@ -612,7 +689,6 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('m'));
-        press(&mut app, KeyCode::Enter);
 
         assert!(app.entries().is_empty());
         assert_eq!(app.selected(), None);
@@ -635,12 +711,11 @@ mod tests {
         let mut app = App::new(entries, home.clone());
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
-        press(&mut app, KeyCode::Char('m'));
         fs::write(&result, b"collision").unwrap();
 
-        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('m'));
 
-        assert_eq!(app.screen(), Screen::Confirmation);
+        assert_eq!(app.screen(), Screen::MovePreview);
         assert!(app.move_error().unwrap().contains("resulting path"));
         assert_eq!(app.proposed_move().unwrap().source(), source);
         assert_eq!(app.proposed_move().unwrap().resulting_path(), result);
@@ -648,7 +723,7 @@ mod tests {
         assert_eq!(fs::read(&result).unwrap(), b"collision");
 
         fs::remove_file(&result).unwrap();
-        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('m'));
 
         assert_eq!(app.screen(), Screen::Inbox);
         assert_eq!(fs::read(&result).unwrap(), b"source");
@@ -671,14 +746,13 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
-        press(&mut app, KeyCode::Char('m'));
         fs::remove_file(&source).unwrap();
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.screen(), Screen::Confirmation);
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.screen(), Screen::MovePreview);
 
         press(&mut app, KeyCode::Esc);
 
-        assert_eq!(app.screen(), Screen::MovePreview);
+        assert_eq!(app.screen(), Screen::DestinationBrowser);
         assert!(
             app.proposed_move()
                 .unwrap()
@@ -690,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_source_is_refused_and_quit_still_works_after_failure() {
+    fn changed_source_type_is_refused_and_quit_still_works_after_failure() {
         let root = std::env::temp_dir().join(format!(
             "downloads-janitor-app-changed-source-{}",
             std::process::id()
@@ -705,15 +779,14 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
-        press(&mut app, KeyCode::Char('m'));
         fs::rename(&source, root.join("original.txt")).unwrap();
-        fs::write(&source, b"replacement").unwrap();
+        fs::create_dir(&source).unwrap();
 
-        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('m'));
 
-        assert_eq!(app.screen(), Screen::Confirmation);
-        assert!(app.move_error().unwrap().contains("source identity"));
-        assert_eq!(fs::read(&source).unwrap(), b"replacement");
+        assert_eq!(app.screen(), Screen::MovePreview);
+        assert!(app.move_error().unwrap().contains("entry type"));
+        assert!(source.is_dir());
         press(&mut app, KeyCode::Char('q'));
         assert!(app.should_quit);
         fs::remove_dir_all(root).unwrap();
@@ -741,7 +814,6 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('m'));
-        press(&mut app, KeyCode::Enter);
 
         assert_eq!(app.screen(), Screen::Inbox);
         assert!(!source.exists());
@@ -773,7 +845,6 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('m'));
-        press(&mut app, KeyCode::Enter);
 
         assert_eq!(app.screen(), Screen::Inbox);
         assert!(app.entries().is_empty());

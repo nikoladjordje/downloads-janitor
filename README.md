@@ -2,7 +2,7 @@
 
 Downloads Janitor is a keyboard-driven Linux terminal application for reviewing
 entries in `~/Downloads` and safely moving one selected entry to a directory
-beneath `$HOME`. Milestone 3 supports explicitly confirmed, same-filesystem
+beneath `$HOME`. Milestone 3 supports explicitly requested, same-filesystem
 moves without overwriting an existing path.
 
 ## Requirements
@@ -25,7 +25,7 @@ cargo run
 
 ## Workflow
 
-The application has four screens:
+The application has three screens:
 
 1. **Inbox** lists the immediate files, directories, and usable symlinks in
    `$HOME/Downloads`. Select one entry and press `Enter`.
@@ -33,10 +33,8 @@ The application has four screens:
    and press `d` to choose the current directory.
 3. **Move Preview** shows the selected entry's type, exact source path, chosen
    Destination, exact resulting path, and any validation failures. A valid
-   Preview remains read-only; press `m` to continue.
-4. **Confirmation** repeats the exact operation and warns that execution will
-   change the filesystem. `Enter` is the sole action that authorizes a Move
-   Attempt.
+   Preview warns that `m` changes the filesystem; pressing it starts one Move
+   Attempt directly.
 
 Returning to an earlier screen preserves its selection. Only one Proposed Move
 is represented at a time.
@@ -49,6 +47,8 @@ is represented at a time.
 | --- | --- |
 | `j` or Down Arrow | Select the next Inbox Entry |
 | `k` or Up Arrow | Select the previous Inbox Entry |
+| `gg` | Select the first Inbox Entry |
+| `G` | Select the final Inbox Entry |
 | `Enter` | Open the Destination Browser for the selected entry |
 | `q` | Quit and restore the terminal |
 
@@ -58,6 +58,8 @@ is represented at a time.
 | --- | --- |
 | `j` or Down Arrow | Select the next row |
 | `k` or Up Arrow | Select the previous row |
+| `gg` | Select the first row |
+| `G` | Select the final row |
 | `Enter`, `l`, or Right Arrow | Enter the selected real directory, or select `..` |
 | `h`, Left Arrow, or Backspace | Return to the parent directory |
 | `d` | Choose the current directory and open Preview |
@@ -68,16 +70,8 @@ is represented at a time.
 
 | Key | Action |
 | --- | --- |
-| `m` | Open Confirmation when the Proposed Move is valid |
+| `m` | Execute one freshly validated Move Attempt when the proposal is valid |
 | `Esc` | Return to the Destination Browser |
-| `q` | Quit and restore the terminal |
-
-### Confirmation
-
-| Key | Action |
-| --- | --- |
-| `Enter` | Execute one freshly validated Move Attempt |
-| `Esc` | Rebuild Move Preview using current filesystem state |
 | `q` | Quit and restore the terminal |
 
 Navigation stops at the first and final rows rather than wrapping.
@@ -115,10 +109,10 @@ guarantee writability or that a future move will succeed.
 ## Execution and safety
 
 A **Proposed Move** is the read-only source, Destination, and resulting path
-shown in Preview. Opening Confirmation captures the source's non-following
-filesystem identity and entry type. Pressing `Enter` creates one **Move
-Attempt**: all Preview validation is repeated, the current source identity and
-type are compared with the captured values, and only then can mutation occur.
+shown in Preview. Pressing `m` captures the source's non-following filesystem
+identity and entry type and creates one **Move Attempt**: all Preview validation
+is repeated, the current source identity and type are compared with the captured
+values, and only then can mutation occur.
 A **Completed Move** means the kernel successfully placed the entry at the
 resulting path.
 
@@ -134,10 +128,10 @@ or deleting the source. Source identity verification is a best-effort userspace
 defense: another process could still replace the source during the unavoidable
 interval between the final identity check and the rename operation.
 
-On failure, Confirmation retains the exact operation and displays the reason.
-`Enter` retries with fresh validation and identity verification; `Esc` rebuilds
-Preview from current filesystem facts. No retry overwrites, implicitly renames,
-copies, rolls back, or queues an entry.
+On failure, Move Preview retains the exact operation and displays the reason.
+`m` retries with fresh validation and identity verification; `Esc` rebuilds the
+proposal from current filesystem facts before returning to Destination Browser.
+No retry overwrites, implicitly renames, copies, rolls back, or queues an entry.
 
 After a Completed Move, the Inbox is rescanned and selection remains at the old
 numeric index where possible, clamped to the final entry or cleared when empty.
@@ -158,9 +152,9 @@ directions whose scope will be refined before implementation.
 
 ### Milestone 3 — Safe Move Execution
 
-Milestone 3 adds the explicit Confirmation and safe single-move execution
-described above. Its narrow guarantee is one confirmed same-filesystem move at
-a time, using atomic no-replace behavior.
+Milestone 3 adds direct execution from Move Preview and safe single-move
+execution described above. Its narrow guarantee is one deliberate
+same-filesystem move at a time, using atomic no-replace behavior.
 
 The complete planned behavior is defined in
 [the Milestone 3 specification](./Downloads%20Janitor%20%E2%80%94%20Milestone%203%20Specification.md).

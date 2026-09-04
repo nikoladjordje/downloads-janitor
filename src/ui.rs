@@ -16,7 +16,6 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::Inbox => render_inbox(frame, app),
         Screen::DestinationBrowser => render_destination(frame, app),
         Screen::MovePreview => render_preview(frame, app),
-        Screen::Confirmation => render_confirmation(frame, app),
     }
 }
 
@@ -61,7 +60,7 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
     frame.render_stateful_widget(list, areas[1], &mut list_state);
 
     frame.render_widget(
-        Paragraph::new("j/k or ↑/↓ Navigate    Enter Choose    q Quit")
+        Paragraph::new("j/k or ↑/↓ Navigate    gg Top    G Bottom    Enter Choose    q Quit")
             .alignment(Alignment::Right)
             .block(Block::default().borders(Borders::ALL)),
         areas[2],
@@ -115,7 +114,7 @@ fn render_destination(frame: &mut Frame<'_>, app: &App) {
         .unwrap_or_default();
     frame.render_widget(
         Paragraph::new(format!(
-            "{error}j/k Navigate  Enter/l Open  h/Backspace Parent  d Choose  Esc Back  q Quit"
+            "{error}j/k Navigate  gg Top  G Bottom  Enter/l Open  h/Backspace Parent  d Choose  Esc Back  q Quit"
         ))
         .alignment(Alignment::Right)
         .block(Block::default().borders(Borders::ALL)),
@@ -151,10 +150,8 @@ fn render_preview(frame: &mut Frame<'_>, app: &App) {
     ];
     if proposal.is_valid() {
         lines.push(Line::from(Span::styled(
-            "Preview only — no files will be changed",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            "Warning: pressing m will change the filesystem",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     } else {
         lines.push(Line::from(Span::styled(
@@ -168,41 +165,6 @@ fn render_preview(frame: &mut Frame<'_>, app: &App) {
                 .map(|failure| Line::from(format!("- {failure}"))),
         );
     }
-    lines.push(Line::default());
-    lines.push(Line::from(if proposal.is_valid() {
-        "m Confirm    Esc Back    q Quit"
-    } else {
-        "Esc Back    q Quit"
-    }));
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Move Preview")),
-        frame.area(),
-    );
-}
-
-fn render_confirmation(frame: &mut Frame<'_>, app: &App) {
-    let proposal = app
-        .proposed_move()
-        .expect("confirmation screen always has a proposed move");
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Type: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!("{:?}", proposal.entry_type())),
-        ]),
-        Line::from(vec![
-            Span::styled("From: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(proposal.source().to_string_lossy()),
-        ]),
-        Line::from(vec![
-            Span::styled("To:   ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(proposal.resulting_path().to_string_lossy()),
-        ]),
-        Line::default(),
-        Line::from(Span::styled(
-            "Warning: executing this move will change the filesystem",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )),
-    ];
     if let Some(error) = app.move_error() {
         lines.push(Line::from(Span::styled(
             format!("Move failed: {error}"),
@@ -210,9 +172,13 @@ fn render_confirmation(frame: &mut Frame<'_>, app: &App) {
         )));
     }
     lines.push(Line::default());
-    lines.push(Line::from("Enter Execute    Esc Back    q Quit"));
+    lines.push(Line::from(if proposal.is_valid() {
+        "m Move    Esc Back    q Quit"
+    } else {
+        "Esc Back    q Quit"
+    }));
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Confirmation")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Move Preview")),
         frame.area(),
     );
 }
@@ -310,14 +276,49 @@ mod tests {
         let entry = InboxEntry::test_entry(source, EntryKind::File, false);
         let mut app = App::new(vec![entry], root.0.clone());
         press(&mut app, KeyCode::Enter);
-        for _ in 0..19 {
-            press(&mut app, KeyCode::Down);
-        }
+        press(&mut app, KeyCode::Char('G'));
 
         let output = rendered(&app, 80, 10);
 
         assert!(output.contains("> directory-19/"));
         assert!(!output.contains("directory-00/"));
+    }
+
+    #[test]
+    fn inbox_render_scrolls_to_vim_jump_target() {
+        let entries = (0..20)
+            .map(|index| InboxEntry::test_file(&format!("entry-{index:02}")))
+            .collect();
+        let mut app = App::new(entries, "/home/tester".into());
+        press(&mut app, KeyCode::Char('G'));
+
+        let output = rendered(&app, 100, 10);
+
+        assert!(output.contains("> entry-19"));
+        assert!(!output.contains("entry-00"));
+    }
+
+    #[test]
+    fn list_footers_advertise_vim_jumps_and_preview_does_not() {
+        let root = TestDirectory::new();
+        let source = root.0.join("source.txt");
+        fs::File::create(&source).unwrap();
+        let entry = InboxEntry::test_entry(source, EntryKind::File, false);
+        let mut app = App::new(vec![entry], root.0.clone());
+
+        let inbox = rendered(&app, 140, 10);
+        assert!(inbox.contains("gg Top"));
+        assert!(inbox.contains("G Bottom"));
+
+        press(&mut app, KeyCode::Enter);
+        let destination = rendered(&app, 140, 10);
+        assert!(destination.contains("gg Top"));
+        assert!(destination.contains("G Bottom"));
+
+        press(&mut app, KeyCode::Char('d'));
+        let preview = rendered(&app, 140, 10);
+        assert!(!preview.contains("gg Top"));
+        assert!(!preview.contains("G Bottom"));
     }
 
     #[test]
@@ -334,11 +335,11 @@ mod tests {
         press(&mut app, KeyCode::Char('d'));
 
         let valid = rendered(&app, 100, 16);
-        assert!(valid.contains("Preview only — no files will be changed"));
+        assert!(valid.contains("Warning: pressing m will change the filesystem"));
         assert!(valid.contains(source.to_string_lossy().as_ref()));
         assert!(valid.contains(destination.join("source.txt").to_string_lossy().as_ref()));
         assert!(valid.contains("Esc Back    q Quit"));
-        assert!(valid.contains("m Confirm"));
+        assert!(valid.contains("m Move"));
         assert!(!valid.contains("d Choose"));
 
         press(&mut app, KeyCode::Esc);
@@ -347,37 +348,12 @@ mod tests {
         let invalid = rendered(&app, 100, 16);
         assert!(invalid.contains("Invalid proposal"));
         assert!(invalid.contains("source no longer exists"));
-        assert!(!invalid.contains("no files will be changed"));
-        assert!(!invalid.contains("m Confirm"));
+        assert!(!invalid.contains("will change the filesystem"));
+        assert!(!invalid.contains("m Move"));
     }
 
     #[test]
-    fn confirmation_renders_exact_operation_warning_and_controls() {
-        let root = TestDirectory::new();
-        let destination = root.0.join("destination");
-        let source = root.0.join("source.txt");
-        fs::create_dir(&destination).unwrap();
-        fs::File::create(&source).unwrap();
-        let entry = InboxEntry::test_entry(source.clone(), EntryKind::File, false);
-        let mut app = App::new(vec![entry], root.0.clone());
-        press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Char('d'));
-        press(&mut app, KeyCode::Char('m'));
-
-        let output = rendered(&app, 100, 14);
-
-        assert!(output.contains("Confirmation"));
-        assert!(output.contains("Type: File"));
-        assert!(output.contains(source.to_string_lossy().as_ref()));
-        assert!(output.contains(destination.join("source.txt").to_string_lossy().as_ref()));
-        assert!(output.contains("will change the filesystem"));
-        assert!(output.contains("Enter Execute    Esc Back    q Quit"));
-        assert!(!output.contains("m Confirm"));
-    }
-
-    #[test]
-    fn confirmation_renders_move_failure_with_preserved_paths() {
+    fn preview_renders_move_failure_with_preserved_paths() {
         let root = TestDirectory::new();
         let destination = root.0.join("destination");
         let source = root.0.join("source.txt");
@@ -388,16 +364,15 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
-        press(&mut app, KeyCode::Char('m'));
         fs::write(destination.join("source.txt"), b"collision").unwrap();
-        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('m'));
 
         let output = rendered(&app, 100, 14);
 
         assert!(output.contains("Move failed: fresh validation failed"));
         assert!(output.contains(source.to_string_lossy().as_ref()));
         assert!(output.contains(destination.join("source.txt").to_string_lossy().as_ref()));
-        assert!(output.contains("Enter Execute    Esc Back    q Quit"));
+        assert!(output.contains("m Move    Esc Back    q Quit"));
     }
 
     fn fail_refresh(_: &Path) -> crate::Result<Vec<InboxEntry>> {
@@ -416,7 +391,6 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('m'));
-        press(&mut app, KeyCode::Enter);
 
         let output = rendered(&app, 120, 12);
 

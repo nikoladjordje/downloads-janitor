@@ -95,6 +95,14 @@ impl DestinationBrowser {
         }
     }
 
+    pub fn move_to_first(&mut self) {
+        self.selected = (!self.entries.is_empty()).then_some(0);
+    }
+
+    pub fn move_to_last(&mut self) {
+        self.selected = self.entries.len().checked_sub(1);
+    }
+
     pub fn enter_selected(&mut self) {
         let Some(entry) = self.selected.and_then(|index| self.entries.get(index)) else {
             return;
@@ -333,6 +341,48 @@ mod tests {
             browser.enter_selected();
             assert_eq!(browser.current(), home.0);
         }
+    }
+
+    #[test]
+    fn jumps_keep_empty_and_single_row_selections_valid() {
+        let home = TestDirectory::new();
+        let mut browser = DestinationBrowser::new(home.0.clone());
+        browser.refresh();
+        browser.move_to_first();
+        browser.move_to_last();
+        assert_eq!(browser.selected(), None);
+
+        fs::create_dir(home.0.join("only")).unwrap();
+        browser.refresh();
+        browser.move_to_last();
+        browser.move_to_first();
+        assert_eq!(browser.selected(), Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jumps_include_parent_and_disabled_symlink_rows() {
+        use std::os::unix::fs::symlink;
+
+        let home = TestDirectory::new();
+        let child = home.0.join("child");
+        let target = home.0.join("target");
+        fs::create_dir(&child).unwrap();
+        fs::create_dir(&target).unwrap();
+        symlink(&target, child.join("z-link")).unwrap();
+        let mut browser = DestinationBrowser::new(home.0.clone());
+        browser.refresh();
+        browser.enter_selected();
+
+        browser.move_to_last();
+        let last = browser.selected().unwrap();
+        assert_eq!(
+            browser.entries()[last].kind(),
+            DestinationEntryKind::DisabledSymlink
+        );
+
+        browser.move_to_first();
+        assert_eq!(browser.entries()[0].kind(), DestinationEntryKind::Parent);
     }
 
     #[test]
