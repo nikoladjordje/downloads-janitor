@@ -18,11 +18,11 @@ pub struct SourceIdentity {
 
 #[derive(Debug)]
 pub enum MoveError {
-    NotRegularFile,
     SourceChanged,
     Validation(String),
     Collision,
     CrossFilesystem,
+    PermissionDenied(io::Error),
     Filesystem(io::Error),
     InvalidPath,
 }
@@ -30,7 +30,6 @@ pub enum MoveError {
 impl fmt::Display for MoveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotRegularFile => formatter.write_str("only regular files can be moved yet"),
             Self::SourceChanged => {
                 formatter.write_str("the source identity or entry type changed after review")
             }
@@ -41,6 +40,12 @@ impl fmt::Display for MoveError {
             Self::CrossFilesystem => formatter.write_str(
                 "cross-filesystem moves are unsupported; no copy or deletion was performed",
             ),
+            Self::PermissionDenied(error) => {
+                write!(
+                    formatter,
+                    "permission denied by the operating system: {error}"
+                )
+            }
             Self::Filesystem(error) => {
                 write!(formatter, "the operating system refused the move: {error}")
             }
@@ -53,11 +58,8 @@ impl fmt::Display for MoveError {
 
 impl SourceIdentity {
     pub fn capture(proposal: &ProposedMove) -> Result<Self, MoveError> {
-        if proposal.entry_type() != ProposedEntryType::File {
-            return Err(MoveError::NotRegularFile);
-        }
         let metadata = fs::symlink_metadata(proposal.source()).map_err(MoveError::Filesystem)?;
-        if !metadata.file_type().is_file() {
+        if !metadata_matches_entry_type(&metadata, proposal.entry_type()) {
             return Err(MoveError::SourceChanged);
         }
         Ok(Self::from_metadata(&metadata))
@@ -72,7 +74,7 @@ impl SourceIdentity {
     }
 }
 
-pub fn execute_regular_file(
+pub fn execute_move(
     reviewed: &ProposedMove,
     entry: &InboxEntry,
     identity: SourceIdentity,
@@ -88,7 +90,7 @@ pub fn execute_regular_file(
             .join("; ");
         return Err(MoveError::Validation(reasons));
     }
-    if fresh.entry_type() != ProposedEntryType::File
+    if fresh.entry_type() != reviewed.entry_type()
         || fresh.source() != reviewed.source()
         || fresh.resulting_path() != reviewed.resulting_path()
     {
@@ -96,11 +98,21 @@ pub fn execute_regular_file(
     }
 
     let metadata = fs::symlink_metadata(fresh.source()).map_err(MoveError::Filesystem)?;
-    if !metadata.file_type().is_file() || SourceIdentity::from_metadata(&metadata) != identity {
+    if !metadata_matches_entry_type(&metadata, reviewed.entry_type())
+        || SourceIdentity::from_metadata(&metadata) != identity
+    {
         return Err(MoveError::SourceChanged);
     }
 
     rename_noreplace(fresh.source(), fresh.resulting_path())
+}
+
+fn metadata_matches_entry_type(metadata: &fs::Metadata, entry_type: ProposedEntryType) -> bool {
+    match entry_type {
+        ProposedEntryType::File => metadata.file_type().is_file(),
+        ProposedEntryType::Directory => metadata.file_type().is_dir(),
+        ProposedEntryType::Symlink => metadata.file_type().is_symlink(),
+    }
 }
 
 fn rename_noreplace(
@@ -128,6 +140,7 @@ fn rename_noreplace(
     match error.raw_os_error() {
         Some(libc::EEXIST) => Err(MoveError::Collision),
         Some(libc::EXDEV) => Err(MoveError::CrossFilesystem),
+        Some(libc::EACCES) | Some(libc::EPERM) => Err(MoveError::PermissionDenied(error)),
         _ => Err(MoveError::Filesystem(error)),
     }
 }
@@ -146,7 +159,7 @@ mod tests {
         proposed_move::ProposedMove,
     };
 
-    use super::{MoveError, SourceIdentity, execute_regular_file, rename_noreplace};
+    use super::{MoveError, SourceIdentity, execute_move, rename_noreplace};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -171,7 +184,7 @@ mod tests {
         let proposal = ProposedMove::new(&entry, &destination).unwrap();
         let identity = SourceIdentity::capture(&proposal).unwrap();
 
-        execute_regular_file(&proposal, &entry, identity).unwrap();
+        execute_move(&proposal, &entry, identity).unwrap();
 
         assert!(!source.exists());
         assert_eq!(
@@ -195,7 +208,7 @@ mod tests {
         fs::write(&source, b"replacement").unwrap();
 
         assert!(matches!(
-            execute_regular_file(&proposal, &entry, identity),
+            execute_move(&proposal, &entry, identity),
             Err(MoveError::SourceChanged)
         ));
         assert_eq!(fs::read(&source).unwrap(), b"replacement");
@@ -251,6 +264,98 @@ mod tests {
         assert!(matches!(result, Err(MoveError::CrossFilesystem)));
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert!(!destination.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn moves_a_non_empty_directory_as_one_entry() {
+        let root = root();
+        let source = root.join("folder");
+        let destination = root.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("nested.txt"), b"nested").unwrap();
+        fs::create_dir(&destination).unwrap();
+        let entry = InboxEntry::test_entry(source.clone(), EntryKind::Directory, false);
+        let proposal = ProposedMove::new(&entry, &destination).unwrap();
+        let identity = SourceIdentity::capture(&proposal).unwrap();
+
+        execute_move(&proposal, &entry, identity).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(destination.join("folder/nested.txt")).unwrap(),
+            b"nested"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_cannot_be_moved_inside_itself() {
+        let root = root();
+        let source = root.join("folder");
+        let descendant = source.join("descendant");
+        fs::create_dir_all(&descendant).unwrap();
+        let entry = InboxEntry::test_entry(source.clone(), EntryKind::Directory, false);
+        let proposal = ProposedMove::new(&entry, &descendant).unwrap();
+        let identity = SourceIdentity::capture(&proposal).unwrap();
+
+        assert!(matches!(
+            execute_move(&proposal, &entry, identity),
+            Err(MoveError::Validation(_))
+        ));
+        assert!(source.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn moves_file_and_directory_symlinks_without_moving_their_targets() {
+        for (name, target_kind) in [
+            ("file-link", EntryKind::File),
+            ("directory-link", EntryKind::Directory),
+        ] {
+            let root = root();
+            let target = root.join("target");
+            let source = root.join(name);
+            let destination = root.join("destination");
+            match target_kind {
+                EntryKind::File => fs::write(&target, b"target").unwrap(),
+                EntryKind::Directory => fs::create_dir(&target).unwrap(),
+            }
+            std::os::unix::fs::symlink(&target, &source).unwrap();
+            fs::create_dir(&destination).unwrap();
+            let entry = InboxEntry::test_entry(source.clone(), target_kind, true);
+            let proposal = ProposedMove::new(&entry, &destination).unwrap();
+            let identity = SourceIdentity::capture(&proposal).unwrap();
+
+            execute_move(&proposal, &entry, identity).unwrap();
+
+            let moved_link = destination.join(name);
+            assert!(!source.exists());
+            assert!(target.exists());
+            assert!(fs::symlink_metadata(&moved_link).unwrap().is_symlink());
+            assert_eq!(fs::read_link(moved_link).unwrap(), target);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn refuses_an_entry_replaced_with_a_different_type() {
+        let root = root();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let entry = InboxEntry::test_entry(source.clone(), EntryKind::Directory, false);
+        let proposal = ProposedMove::new(&entry, &destination).unwrap();
+        let identity = SourceIdentity::capture(&proposal).unwrap();
+        fs::rename(&source, root.join("original")).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+
+        assert!(matches!(
+            execute_move(&proposal, &entry, identity),
+            Err(MoveError::SourceChanged)
+        ));
+        assert_eq!(fs::read(source).unwrap(), b"replacement");
         fs::remove_dir_all(root).unwrap();
     }
 }

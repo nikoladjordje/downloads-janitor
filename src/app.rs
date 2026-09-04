@@ -157,7 +157,7 @@ impl App {
                 }
                 KeyCode::Enter if self.screen == Screen::Confirmation => self.attempt_move(),
                 KeyCode::Esc if self.screen == Screen::Confirmation => {
-                    self.screen = Screen::MovePreview;
+                    self.return_to_refreshed_preview();
                 }
                 KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::DestinationBrowser => {
                     self.destination_browser.move_down();
@@ -192,7 +192,7 @@ impl App {
         let result = self.proposed_move.as_ref().map_or_else(
             || Err("the reviewed move is unavailable".to_owned()),
             |proposal| {
-                move_execution::execute_regular_file(proposal, &self.entries[index], identity)
+                move_execution::execute_move(proposal, &self.entries[index], identity)
                     .map_err(|error| error.to_string())
             },
         );
@@ -218,6 +218,15 @@ impl App {
                 ));
             }
         }
+    }
+
+    fn return_to_refreshed_preview(&mut self) {
+        self.proposed_move = self.selection.index().and_then(|index| {
+            ProposedMove::new(&self.entries[index], self.destination_browser.current())
+        });
+        self.source_identity = None;
+        self.move_error = None;
+        self.screen = Screen::MovePreview;
     }
 }
 
@@ -594,5 +603,105 @@ mod tests {
         assert!(app.entries().is_empty());
         assert_eq!(app.selected(), None);
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn failed_collision_preserves_context_and_retry_can_succeed() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-retry-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        let source = downloads.join("source.txt");
+        let result = home.join("source.txt");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let entries = crate::inbox::scan_inbox(&downloads).unwrap();
+        let mut app = App::new(entries, home.clone());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('m'));
+        fs::write(&result, b"collision").unwrap();
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.screen(), Screen::Confirmation);
+        assert!(app.move_error().unwrap().contains("resulting path"));
+        assert_eq!(app.proposed_move().unwrap().source(), source);
+        assert_eq!(app.proposed_move().unwrap().resulting_path(), result);
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&result).unwrap(), b"collision");
+
+        fs::remove_file(&result).unwrap();
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert_eq!(fs::read(&result).unwrap(), b"source");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn back_after_failure_rebuilds_and_revalidates_preview() {
+        let root = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-failed-back-{}",
+            std::process::id()
+        ));
+        let source = root.join("source.txt");
+        let destination = root.join("destination");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let entry = InboxEntry::test_entry(source.clone(), crate::inbox::EntryKind::File, false);
+        let mut app = App::new(vec![entry], root.clone());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('m'));
+        fs::remove_file(&source).unwrap();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::Confirmation);
+
+        press(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.screen(), Screen::MovePreview);
+        assert!(
+            app.proposed_move()
+                .unwrap()
+                .failures()
+                .contains(&crate::proposed_move::ValidationFailure::SourceMissing)
+        );
+        assert_eq!(app.move_error(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_source_is_refused_and_quit_still_works_after_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-changed-source-{}",
+            std::process::id()
+        ));
+        let source = root.join("source.txt");
+        let destination = root.join("destination");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, b"original").unwrap();
+        let entry = InboxEntry::test_entry(source.clone(), crate::inbox::EntryKind::File, false);
+        let mut app = App::new(vec![entry], root.clone());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('m'));
+        fs::rename(&source, root.join("original.txt")).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.screen(), Screen::Confirmation);
+        assert!(app.move_error().unwrap().contains("source identity"));
+        assert_eq!(fs::read(&source).unwrap(), b"replacement");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.should_quit);
+        fs::remove_dir_all(root).unwrap();
     }
 }

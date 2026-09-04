@@ -375,4 +375,28 @@ mod tests {
         assert!(output.contains("Enter Execute    Esc Back    q Quit"));
         assert!(!output.contains("m Confirm"));
     }
+
+    #[test]
+    fn confirmation_renders_move_failure_with_preserved_paths() {
+        let root = TestDirectory::new();
+        let destination = root.0.join("destination");
+        let source = root.0.join("source.txt");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let entry = InboxEntry::test_entry(source.clone(), EntryKind::File, false);
+        let mut app = App::new(vec![entry], root.0.clone());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('m'));
+        fs::write(destination.join("source.txt"), b"collision").unwrap();
+        press(&mut app, KeyCode::Enter);
+
+        let output = rendered(&app, 100, 14);
+
+        assert!(output.contains("Move failed: fresh validation failed"));
+        assert!(output.contains(source.to_string_lossy().as_ref()));
+        assert!(output.contains(destination.join("source.txt").to_string_lossy().as_ref()));
+        assert!(output.contains("Enter Execute    Esc Back    q Quit"));
+    }
 }
