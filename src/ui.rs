@@ -24,7 +24,7 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(if app.notice().is_some() { 4 } else { 3 }),
             Constraint::Fill(1),
             Constraint::Length(3),
         ])
@@ -32,7 +32,7 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
 
     let notice = app
         .notice()
-        .map(|notice| format!("    {notice}"))
+        .map(|notice| format!("\n{notice}"))
         .unwrap_or_default();
     frame.render_widget(
         Paragraph::new(format!(
@@ -220,8 +220,8 @@ fn render_confirmation(frame: &mut Frame<'_>, app: &App) {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
-        path::PathBuf,
+        fs, io,
+        path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -398,5 +398,31 @@ mod tests {
         assert!(output.contains(source.to_string_lossy().as_ref()));
         assert!(output.contains(destination.join("source.txt").to_string_lossy().as_ref()));
         assert!(output.contains("Enter Execute    Esc Back    q Quit"));
+    }
+
+    fn fail_refresh(_: &Path) -> crate::Result<Vec<InboxEntry>> {
+        Err(io::Error::other("injected refresh failure").into())
+    }
+
+    #[test]
+    fn inbox_renders_success_and_stale_warning_after_refresh_failure() {
+        let root = TestDirectory::new();
+        let downloads = root.0.join("Downloads");
+        let source = downloads.join("source.txt");
+        fs::create_dir(&downloads).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let entry = InboxEntry::test_entry(source, EntryKind::File, false);
+        let mut app = App::with_inbox_scanner(vec![entry], root.0.clone(), fail_refresh);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Enter);
+
+        let output = rendered(&app, 120, 12);
+
+        assert!(output.contains("Move completed successfully"));
+        assert!(output.contains("Inbox refresh failed: injected refresh failure"));
+        assert!(output.contains("Remaining entries may be stale"));
+        assert!(!output.contains("Move failed"));
     }
 }

@@ -15,6 +15,8 @@ use crate::{
     ui,
 };
 
+type InboxScanner = fn(&Path) -> Result<Vec<InboxEntry>>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Screen {
     Inbox,
@@ -33,11 +35,20 @@ pub struct App {
     notice: Option<String>,
     move_error: Option<String>,
     inbox_path: PathBuf,
+    inbox_scanner: InboxScanner,
     should_quit: bool,
 }
 
 impl App {
     pub fn new(entries: Vec<InboxEntry>, home: PathBuf) -> Self {
+        Self::with_inbox_scanner(entries, home, inbox::scan_inbox)
+    }
+
+    pub(crate) fn with_inbox_scanner(
+        entries: Vec<InboxEntry>,
+        home: PathBuf,
+        inbox_scanner: InboxScanner,
+    ) -> Self {
         let selection = Selection::new(entries.len());
         let inbox_path = home.join("Downloads");
         Self {
@@ -50,6 +61,7 @@ impl App {
             notice: None,
             move_error: None,
             inbox_path,
+            inbox_scanner,
             should_quit: false,
         }
     }
@@ -189,35 +201,37 @@ impl App {
             self.move_error = Some("the reviewed source identity is unavailable".to_owned());
             return;
         };
-        let result = self.proposed_move.as_ref().map_or_else(
-            || Err("the reviewed move is unavailable".to_owned()),
-            |proposal| {
-                move_execution::execute_move(proposal, &self.entries[index], identity)
-                    .map_err(|error| error.to_string())
-            },
-        );
-        if let Err(error) = result {
-            self.move_error = Some(error);
+        let Some(proposal) = self.proposed_move.as_ref() else {
+            self.move_error = Some("the reviewed move is unavailable".to_owned());
+            return;
+        };
+        let moved_source = proposal.source().to_path_buf();
+        if let Err(error) = move_execution::execute_move(proposal, &self.entries[index], identity) {
+            self.move_error = Some(error.to_string());
             return;
         }
 
-        match inbox::scan_inbox(&self.inbox_path) {
+        let refresh = (self.inbox_scanner)(&self.inbox_path);
+        let notice = match refresh {
             Ok(entries) => {
                 self.entries = entries;
-                self.selection
-                    .repair_after_removal(index, self.entries.len());
-                self.screen = Screen::Inbox;
-                self.proposed_move = None;
-                self.source_identity = None;
-                self.move_error = None;
-                self.notice = Some("Move completed successfully".to_owned());
+                "Move completed successfully".to_owned()
             }
             Err(error) => {
-                self.move_error = Some(format!(
-                    "move completed, but the Downloads inbox could not be refreshed: {error}"
-                ));
+                self.entries.retain(|entry| entry.path() != moved_source);
+                format!(
+                    "Move completed successfully; Inbox refresh failed: {error}. Remaining entries may be stale"
+                )
             }
-        }
+        };
+
+        self.selection
+            .repair_after_removal(index, self.entries.len());
+        self.screen = Screen::Inbox;
+        self.proposed_move = None;
+        self.source_identity = None;
+        self.move_error = None;
+        self.notice = Some(notice);
     }
 
     fn return_to_refreshed_preview(&mut self) {
@@ -273,7 +287,7 @@ fn contextual_io_error(context: &'static str, source: io::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, io, path::Path};
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
@@ -703,5 +717,67 @@ mod tests {
         press(&mut app, KeyCode::Char('q'));
         assert!(app.should_quit);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn fail_refresh(_: &Path) -> crate::Result<Vec<InboxEntry>> {
+        Err(io::Error::other("injected refresh failure").into())
+    }
+
+    #[test]
+    fn completed_move_with_refresh_failure_uses_stale_safe_fallback() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-refresh-failure-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        let source = downloads.join("alpha.txt");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(&source, b"alpha").unwrap();
+        fs::write(downloads.join("beta.txt"), b"beta").unwrap();
+        let entries = crate::inbox::scan_inbox(&downloads).unwrap();
+        let mut app = App::with_inbox_scanner(entries, home.clone(), fail_refresh);
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert!(!source.exists());
+        assert_eq!(fs::read(home.join("alpha.txt")).unwrap(), b"alpha");
+        assert_eq!(app.entries().len(), 1);
+        assert_eq!(app.entries()[0].path(), downloads.join("beta.txt"));
+        assert_eq!(app.selected(), Some(0));
+        let notice = app.notice().unwrap();
+        assert!(notice.contains("Move completed successfully"));
+        assert!(notice.contains("Inbox refresh failed"));
+        assert!(notice.contains("may be stale"));
+        assert_eq!(app.move_error(), None);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn refresh_failure_after_last_move_leaves_empty_selection() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-empty-refresh-failure-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(downloads.join("only.txt"), b"only").unwrap();
+        let entries = crate::inbox::scan_inbox(&downloads).unwrap();
+        let mut app = App::with_inbox_scanner(entries, home.clone(), fail_refresh);
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert!(app.entries().is_empty());
+        assert_eq!(app.selected(), None);
+        fs::remove_dir_all(home).unwrap();
     }
 }

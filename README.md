@@ -1,9 +1,9 @@
 # Downloads Janitor
 
 Downloads Janitor is a keyboard-driven Linux terminal application for reviewing
-entries in `~/Downloads` and previewing where one entry could be placed. The
-currently implemented Milestone 2 workflow is strictly read-only: it never
-moves, renames, deletes, queues, or persists anything.
+entries in `~/Downloads` and safely moving one selected entry to a directory
+beneath `$HOME`. Milestone 3 supports explicitly confirmed, same-filesystem
+moves without overwriting an existing path.
 
 ## Requirements
 
@@ -25,15 +25,18 @@ cargo run
 
 ## Workflow
 
-The application has three screens:
+The application has four screens:
 
 1. **Inbox** lists the immediate files, directories, and usable symlinks in
    `$HOME/Downloads`. Select one entry and press `Enter`.
 2. **Destination Browser** starts at `$HOME`. Browse to an existing directory
    and press `d` to choose the current directory.
 3. **Move Preview** shows the selected entry's type, exact source path, chosen
-   Destination, exact resulting path, and any validation failures. Press `Esc`
-   to return to the browser.
+   Destination, exact resulting path, and any validation failures. A valid
+   Preview remains read-only; press `m` to continue.
+4. **Confirmation** repeats the exact operation and warns that execution will
+   change the filesystem. `Enter` is the sole action that authorizes a Move
+   Attempt.
 
 Returning to an earlier screen preserves its selection. Only one Proposed Move
 is represented at a time.
@@ -65,7 +68,16 @@ is represented at a time.
 
 | Key | Action |
 | --- | --- |
+| `m` | Open Confirmation when the Proposed Move is valid |
 | `Esc` | Return to the Destination Browser |
+| `q` | Quit and restore the terminal |
+
+### Confirmation
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Execute one freshly validated Move Attempt |
+| `Esc` | Rebuild Move Preview using current filesystem state |
 | `q` | Quit and restore the terminal |
 
 Navigation stops at the first and final rows rather than wrapping.
@@ -98,44 +110,57 @@ proposal is shown as invalid when:
 - the source and resulting path are identical.
 
 A valid Preview means only that these checks passed at that moment. It does not
-guarantee writability or that a future move would succeed.
+guarantee writability or that a future move will succeed.
 
-## Milestone 2 scope and safety
+## Execution and safety
 
-Preview does not perform or authorize a move. The production code only reads
-directory entries and filesystem metadata. It does not inspect file contents or
-recursively scan directory contents.
+A **Proposed Move** is the read-only source, Destination, and resulting path
+shown in Preview. Opening Confirmation captures the source's non-following
+filesystem identity and entry type. Pressing `Enter` creates one **Move
+Attempt**: all Preview validation is repeated, the current source identity and
+type are compared with the captured values, and only then can mutation occur.
+A **Completed Move** means the kernel successfully placed the entry at the
+resulting path.
 
-Execution, confirmation, collision resolution, renaming, queues, configuration,
-persistence, favorites, hidden-directory browsing, directory-symlink traversal,
-undo/history, organization rules, filesystem watching, and background work are
-deliberately deferred.
+Execution uses Linux atomic no-replace rename behavior. It supports regular
+files, non-empty directories, and Symlink Entries when source and Destination
+are on the same filesystem. Directories are moved as single native entries;
+their contents are not recursively enumerated, copied, or merged. A symlink
+move renames the link itself and leaves its target untouched.
+
+The no-replace kernel operation prevents overwriting even if a collision appears
+between validation and execution. Cross-filesystem moves fail without copying
+or deleting the source. Source identity verification is a best-effort userspace
+defense: another process could still replace the source during the unavoidable
+interval between the final identity check and the rename operation.
+
+On failure, Confirmation retains the exact operation and displays the reason.
+`Enter` retries with fresh validation and identity verification; `Esc` rebuilds
+Preview from current filesystem facts. No retry overwrites, implicitly renames,
+copies, rolls back, or queues an entry.
+
+After a Completed Move, the Inbox is rescanned and selection remains at the old
+numeric index where possible, clamped to the final entry or cleared when empty.
+The success notice remains until the next handled action. If refresh fails after
+the move, the move still counts as completed: the app returns to Inbox, removes
+the known-moved source from its retained list, and reports both success and that
+the remaining entries may be stale.
+
+Downloads Janitor does not provide cross-filesystem copy-then-delete, overwrite,
+merge or collision resolution, automatic or user-directed renaming, delete or
+trash, undo or rollback, queues or bulk execution, persistence, rules,
+recursive processing, filesystem watching, timers, or background work.
 
 ## Roadmap
 
-Milestones 1 and 2 are implemented. Milestone 3 has an agreed specification but
-is not implemented yet. Milestones 4 through 6 are proposed directions whose
-scope will be refined before implementation.
+Milestones 1 through 3 are implemented. Milestones 4 through 6 are proposed
+directions whose scope will be refined before implementation.
 
 ### Milestone 3 — Safe Move Execution
 
-Milestone 3 will turn one valid Proposed Move into an explicitly authorized
-filesystem change. A valid Preview will open a separate Confirmation screen
-showing the exact source and resulting paths. Pressing `Enter` there will start
-one Move Attempt after repeating validation and verifying that the source is
-still the same Inbox Entry the user reviewed.
-
-Execution will use Linux's atomic no-replace rename behavior. Regular files,
-non-empty directories, and Symlink Entries will be supported when source and
-Destination are on the same filesystem. Existing paths will never be
-overwritten, and cross-filesystem copy-then-delete behavior will remain out of
-scope.
-
-A failed Move Attempt will remain recoverable on Confirmation and may be
-retried using fresh filesystem state. A Completed Move will return to a
-rescanned Inbox, select the next logical entry, and show a success notice. If
-the move succeeds but refreshing the Inbox fails, the application will report
-both outcomes accurately rather than claiming that the move failed.
+Milestone 3 adds the explicit Confirmation and safe single-move execution
+described above. Its narrow guarantee is one confirmed same-filesystem move at
+a time, using atomic no-replace behavior.
 
 The complete planned behavior is defined in
 [the Milestone 3 specification](./Downloads%20Janitor%20%E2%80%94%20Milestone%203%20Specification.md).
