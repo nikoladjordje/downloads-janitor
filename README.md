@@ -150,14 +150,26 @@ recursive processing, filesystem watching, timers, or background work.
 Milestones 1 through 3 are implemented. Milestones 4 through 6 are proposed
 directions whose scope will be refined before implementation.
 
+### Milestone 1 — Read-Only Inbox Review
+
+Milestone 1 solves the first problem in cleaning up Downloads: understanding
+what is there without risking accidental changes. It provides a keyboard-driven
+Inbox that lists immediate files, directories, and usable symlinks while keeping
+the entire application read-only.
+
+### Milestone 2 — Destination Selection and Move Preview
+
+Milestone 2 solves the planning problem: deciding where one Inbox Entry should
+go and checking whether that move is sensible before changing the filesystem.
+It adds the bounded Destination Browser and a read-only Move Preview with path,
+collision, source, and directory-ancestry validation.
+
 ### Milestone 3 — Safe Move Execution
 
-Milestone 3 adds direct execution from Move Preview and safe single-move
-execution described above. Its narrow guarantee is one deliberate
-same-filesystem move at a time, using atomic no-replace behavior.
-
-The complete planned behavior is defined in
-[the Milestone 3 specification](./Downloads%20Janitor%20%E2%80%94%20Milestone%203%20Specification.md).
+Milestone 3 solves the execution problem: carrying out the exact move the user
+reviewed while protecting against stale filesystem state and collisions. It
+adds direct execution from Move Preview with a narrow guarantee of one
+deliberate same-filesystem move at a time, using atomic no-replace behavior.
 
 ### Milestone 4 — Efficient Inbox Processing
 
