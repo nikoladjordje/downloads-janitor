@@ -57,6 +57,18 @@ impl fmt::Display for MoveError {
 }
 
 impl SourceIdentity {
+    pub(crate) fn parts(self) -> (u64, u64, u32) {
+        (self.device, self.inode, self.file_type)
+    }
+
+    pub(crate) fn from_parts(device: u64, inode: u64, file_type: u32) -> Option<Self> {
+        matches!(file_type, libc::S_IFREG | libc::S_IFDIR | libc::S_IFLNK).then_some(Self {
+            device,
+            inode,
+            file_type,
+        })
+    }
+
     pub fn capture(proposal: &ProposedMove) -> Result<Self, MoveError> {
         let metadata = fs::symlink_metadata(proposal.source()).map_err(MoveError::Filesystem)?;
         if !metadata_matches_entry_type(&metadata, proposal.entry_type()) {
@@ -65,7 +77,7 @@ impl SourceIdentity {
         Ok(Self::from_metadata(&metadata))
     }
 
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    pub(crate) fn from_metadata(metadata: &fs::Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -79,8 +91,12 @@ pub fn execute_move(
     entry: &InboxEntry,
     identity: SourceIdentity,
 ) -> Result<(), MoveError> {
-    let fresh = ProposedMove::new(entry, reviewed.destination())
-        .ok_or_else(|| MoveError::Validation("the source has no basename".to_owned()))?;
+    let basename = reviewed
+        .resulting_path()
+        .file_name()
+        .ok_or_else(|| MoveError::Validation("the result has no basename".to_owned()))?;
+    let fresh = ProposedMove::with_basename(entry, reviewed.destination(), basename)
+        .map_err(MoveError::Validation)?;
     if !fresh.is_valid() {
         let reasons = fresh
             .failures()

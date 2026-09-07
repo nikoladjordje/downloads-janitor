@@ -1,5 +1,7 @@
 use std::{
+    ffi::OsStr,
     fmt, fs, io,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
@@ -49,7 +51,23 @@ pub struct ProposedMove {
 
 impl ProposedMove {
     pub fn new(entry: &InboxEntry, destination: &Path) -> Option<Self> {
-        let basename = entry.path().file_name()?;
+        Self::with_basename(entry, destination, entry.path().file_name()?).ok()
+    }
+
+    pub(crate) fn with_basename(
+        entry: &InboxEntry,
+        destination: &Path,
+        basename: &OsStr,
+    ) -> Result<Self, String> {
+        let bytes = basename.as_bytes();
+        if bytes.is_empty()
+            || bytes == b"."
+            || bytes == b".."
+            || bytes.contains(&b'/')
+            || bytes.contains(&0)
+        {
+            return Err("enter one non-empty basename without /, NUL, . or ..".to_owned());
+        }
         let entry_type = entry_type(entry);
         let source = entry.path().to_path_buf();
         let destination = destination.to_path_buf();
@@ -61,7 +79,7 @@ impl ProposedMove {
             resulting_path.as_path(),
         );
 
-        Some(Self {
+        Ok(Self {
             entry_type,
             source,
             destination,

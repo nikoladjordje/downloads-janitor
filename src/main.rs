@@ -1,6 +1,9 @@
 mod app;
 mod destination;
+mod filename_editor;
+mod ignored_entries;
 mod inbox;
+mod inbox_marks;
 mod move_execution;
 mod proposed_move;
 mod terminal;

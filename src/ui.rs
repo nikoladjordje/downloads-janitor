@@ -15,7 +15,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     match app.screen() {
         Screen::Inbox => render_inbox(frame, app),
         Screen::DestinationBrowser => render_destination(frame, app),
-        Screen::MovePreview => render_preview(frame, app),
+        Screen::MovePreview | Screen::RenamePreview => render_preview(frame, app),
+        Screen::RenameEditor | Screen::MoveNameEditor => render_rename_editor(frame, app),
     }
 }
 
@@ -23,9 +24,15 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(if app.notice().is_some() { 4 } else { 3 }),
+            Constraint::Length(if app.ignored_warning().is_some() {
+                6
+            } else if app.notice().is_some() {
+                4
+            } else {
+                3
+            }),
             Constraint::Fill(1),
-            Constraint::Length(3),
+            Constraint::Length(5),
         ])
         .split(frame.area());
 
@@ -33,11 +40,27 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
         .notice()
         .map(|notice| format!("\n{notice}"))
         .unwrap_or_default();
+    let warning = app
+        .ignored_warning()
+        .map(|warning| format!("\n{warning}"))
+        .unwrap_or_default();
     frame.render_widget(
         Paragraph::new(format!(
-            "~/Downloads    {} entries{notice}",
-            app.entries().len()
+            "{}    {} entries    {} marked{}{notice}{warning}",
+            if app.viewing_ignored() {
+                "Ignored Entries"
+            } else {
+                "~/Downloads"
+            },
+            app.entries().len(),
+            app.marked_count(),
+            if app.visual_selection() {
+                "    VISUAL"
+            } else {
+                ""
+            }
         ))
+        .wrap(ratatui::widgets::Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -49,7 +72,13 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
     let items = app
         .entries()
         .iter()
-        .map(|entry| ListItem::new(entry.display_name()))
+        .map(|entry| {
+            ListItem::new(format!(
+                "{}{}",
+                entry.display_name(),
+                if app.marked(entry) { " [x]" } else { "" }
+            ))
+        })
         .collect::<Vec<_>>();
     let list = List::new(items)
         .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
@@ -60,9 +89,13 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
     frame.render_stateful_widget(list, areas[1], &mut list_state);
 
     frame.render_widget(
-        Paragraph::new("j/k or ↑/↓ Navigate    gg Top    G Bottom    Enter Choose    q Quit")
-            .alignment(Alignment::Right)
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(if app.viewing_ignored() {
+            "j/k ↑/↓ Navigate  gg Top  G Bottom  u Restore  I Inbox  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\nR Refresh"
+        } else {
+            "j/k ↑/↓ Navigate  gg Top  G Bottom  Enter Choose  r Rename  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\ni Ignore  I Ignored entries  R Refresh"
+        })
+        .alignment(Alignment::Right)
+        .block(Block::default().borders(Borders::ALL)),
         areas[2],
     );
 }
@@ -122,7 +155,39 @@ fn render_destination(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
+fn render_rename_editor(frame: &mut Frame<'_>, app: &App) {
+    let name = app.rename_name().expect("rename editor has a basename");
+    let source = app.entries()[app.selected().expect("rename has a selection")].path();
+    let mut lines = vec![
+        Line::from(format!("From: {source:?}")),
+        Line::from(format!("Basename: {name:?}")),
+        Line::from("Type to append; Backspace removes the last character; Ctrl+u clears."),
+        Line::from("Quotes and escapes show exact filename bytes; they are not added to the name."),
+        Line::default(),
+        Line::from("Enter Review    Esc Cancel"),
+    ];
+    if let Some(error) = app.move_error() {
+        lines.push(Line::from(Span::styled(
+            error,
+            Style::default().fg(Color::Red),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(
+                if app.screen() == Screen::MoveNameEditor {
+                    "Edit Move Basename"
+                } else {
+                    "Rename Entry"
+                },
+            )),
+        frame.area(),
+    );
+}
+
 fn render_preview(frame: &mut Frame<'_>, app: &App) {
+    let renaming = app.screen() == Screen::RenamePreview;
     let proposal = app
         .proposed_move()
         .expect("preview screen always has a proposed move");
@@ -133,24 +198,24 @@ fn render_preview(frame: &mut Frame<'_>, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("From: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(proposal.source().to_string_lossy()),
+            Span::raw(format!("{:?}", proposal.source())),
         ]),
         Line::from(vec![
             Span::styled(
                 "Destination: ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw(proposal.destination().to_string_lossy()),
+            Span::raw(format!("{:?}", proposal.destination())),
         ]),
         Line::from(vec![
             Span::styled("To:   ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(proposal.resulting_path().to_string_lossy()),
+            Span::raw(format!("{:?}", proposal.resulting_path())),
         ]),
         Line::default(),
     ];
     if proposal.is_valid() {
         lines.push(Line::from(Span::styled(
-            "Warning: pressing m will change the filesystem",
+            "Warning: pressing Enter will change the filesystem",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     } else {
@@ -167,18 +232,28 @@ fn render_preview(frame: &mut Frame<'_>, app: &App) {
     }
     if let Some(error) = app.move_error() {
         lines.push(Line::from(Span::styled(
-            format!("Move failed: {error}"),
+            format!(
+                "{} failed: {error}",
+                if renaming { "Rename" } else { "Move" }
+            ),
             Style::default().fg(Color::Red),
         )));
     }
     lines.push(Line::default());
-    lines.push(Line::from(if proposal.is_valid() {
-        "m Move    Esc Back    q Quit"
-    } else {
-        "Esc Back    q Quit"
+    lines.push(Line::from(match (renaming, proposal.is_valid()) {
+        (true, true) => "Enter Rename    Esc Cancel    q Quit",
+        (true, false) => "Esc Cancel    q Quit",
+        (false, true) => "Enter Move    r Edit name    Esc Back    q Quit",
+        (false, false) => "r Edit name    Esc Back    q Quit",
     }));
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Move Preview")),
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(if renaming {
+                "Rename Preview"
+            } else {
+                "Move Preview"
+            })),
         frame.area(),
     );
 }
@@ -191,7 +266,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
 
     use crate::{
@@ -335,21 +410,33 @@ mod tests {
         press(&mut app, KeyCode::Char('d'));
 
         let valid = rendered(&app, 100, 16);
-        assert!(valid.contains("Warning: pressing m will change the filesystem"));
+        assert!(valid.contains("Warning: pressing Enter will change the filesystem"));
         assert!(valid.contains(source.to_string_lossy().as_ref()));
         assert!(valid.contains(destination.join("source.txt").to_string_lossy().as_ref()));
         assert!(valid.contains("Esc Back    q Quit"));
-        assert!(valid.contains("m Move"));
+        assert!(valid.contains("Enter Move"));
+        assert!(!valid.contains("m Move"));
         assert!(!valid.contains("d Choose"));
 
+        app.handle_event(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        )));
+        assert_eq!(rendered(&app, 100, 16), valid);
+        assert!(source.exists());
+        assert!(!destination.join("source.txt").exists());
+
         press(&mut app, KeyCode::Esc);
+        assert!(rendered(&app, 100, 16).contains("Destination Browser"));
+        assert!(source.exists());
         fs::remove_file(&source).unwrap();
         press(&mut app, KeyCode::Char('d'));
         let invalid = rendered(&app, 100, 16);
         assert!(invalid.contains("Invalid proposal"));
         assert!(invalid.contains("source no longer exists"));
         assert!(!invalid.contains("will change the filesystem"));
-        assert!(!invalid.contains("m Move"));
+        assert!(!invalid.contains("Enter Move"));
     }
 
     #[test]
@@ -365,14 +452,14 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
         fs::write(destination.join("source.txt"), b"collision").unwrap();
-        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Enter);
 
         let output = rendered(&app, 100, 14);
 
         assert!(output.contains("Move failed: fresh validation failed"));
         assert!(output.contains(source.to_string_lossy().as_ref()));
         assert!(output.contains(destination.join("source.txt").to_string_lossy().as_ref()));
-        assert!(output.contains("m Move    Esc Back    q Quit"));
+        assert!(output.contains("Enter Move    r Edit name    Esc Back    q Quit"));
     }
 
     fn fail_refresh(_: &Path) -> crate::Result<Vec<InboxEntry>> {
@@ -390,7 +477,7 @@ mod tests {
         let mut app = App::with_inbox_scanner(vec![entry], root.0.clone(), fail_refresh);
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
-        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Enter);
 
         let output = rendered(&app, 120, 12);
 
@@ -398,5 +485,178 @@ mod tests {
         assert!(output.contains("Inbox refresh failed: injected refresh failure"));
         assert!(output.contains("Remaining entries may be stale"));
         assert!(!output.contains("Move failed"));
+    }
+    #[test]
+    fn rename_screens_show_exact_names_review_warning_and_failure() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = TestDirectory::new();
+        let downloads = root.0.join("Downloads");
+        fs::create_dir(&downloads).unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"raw-\xff");
+        let source = downloads.join(name);
+        fs::write(&source, b"source").unwrap();
+        let mut app = App::new(
+            crate::inbox::scan_inbox(&downloads).unwrap(),
+            root.0.clone(),
+        );
+        assert!(rendered(&app, 100, 14).contains("r Rename"));
+
+        press(&mut app, KeyCode::Char('r'));
+        let editor = rendered(&app, 120, 16);
+        assert!(editor.contains("Rename Entry"));
+        assert!(editor.contains(&format!("Basename: {name:?}")));
+        assert!(editor.contains("Enter Review    Esc Cancel"));
+        assert!(!editor.contains("q Quit"));
+
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Enter);
+        let preview = rendered(&app, 120, 16);
+        let result = downloads.join(std::ffi::OsStr::from_bytes(b"raw-\xffq"));
+        assert!(preview.contains("Rename Preview"));
+        assert!(preview.contains(&format!("From: {source:?}")));
+        assert!(preview.contains(&format!("To:   {result:?}")));
+        assert!(preview.contains("Warning: pressing Enter will change the filesystem"));
+        assert!(preview.contains("Enter Rename    Esc Cancel"));
+        assert!(source.exists());
+        assert!(!result.exists());
+
+        fs::write(&result, b"collision").unwrap();
+        press(&mut app, KeyCode::Enter);
+        let failed = rendered(&app, 160, 16);
+        assert!(failed.contains("Rename failed: fresh validation failed"));
+        assert!(failed.contains(&format!("From: {source:?}")));
+        assert!(failed.contains(&format!("To:   {result:?}")));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Enter);
+        let unchanged = rendered(&app, 120, 16);
+        assert!(unchanged.contains("Invalid proposal"));
+        assert!(!unchanged.contains("Enter Rename"));
+        assert!(!unchanged.contains("will change the filesystem"));
+    }
+    #[test]
+    fn move_preview_edits_and_displays_exact_resulting_filename() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = TestDirectory::new();
+        let downloads = root.0.join("Downloads");
+        fs::create_dir(&downloads).unwrap();
+        let source = downloads.join(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+        fs::write(&source, b"source").unwrap();
+        let mut app = App::new(
+            crate::inbox::scan_inbox(&downloads).unwrap(),
+            root.0.clone(),
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(rendered(&app, 140, 16).contains("r Edit name"));
+        press(&mut app, KeyCode::Char('r'));
+        let editor = rendered(&app, 140, 16);
+        assert!(editor.contains("Edit Move Basename"));
+        assert!(editor.contains(&format!("Basename: {:?}", source.file_name().unwrap())));
+        assert!(!editor.contains("q Quit"));
+
+        press(&mut app, KeyCode::Char('é'));
+        press(&mut app, KeyCode::Enter);
+        let mut name = source.file_name().unwrap().to_os_string();
+        name.push("é");
+        let result = root.0.join(name);
+        let preview = rendered(&app, 140, 16);
+        assert!(preview.contains("Move Preview"));
+        assert!(preview.contains(&format!("From: {source:?}")));
+        assert!(preview.contains(&format!("Destination: {:?}", root.0)));
+        assert!(preview.contains(&format!("To:   {result:?}")));
+        assert!(preview.contains("Enter Move    r Edit name"));
+        assert!(source.exists());
+        assert!(!result.exists());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(fs::read(result).unwrap(), b"source");
+        assert!(!source.exists());
+    }
+    #[test]
+    fn inbox_renders_marks_cursor_visual_mode_count_and_selection_controls() {
+        let root = TestDirectory::new();
+        let downloads = root.0.join("Downloads");
+        fs::create_dir(&downloads).unwrap();
+        fs::write(downloads.join("alpha"), b"a").unwrap();
+        fs::write(downloads.join("beta"), b"b").unwrap();
+        let mut app = App::new(
+            crate::inbox::scan_inbox(&downloads).unwrap(),
+            root.0.clone(),
+        );
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Down);
+        let output = rendered(&app, 100, 14);
+        assert!(output.contains("alpha [x]"));
+        assert!(output.contains("> beta"));
+        assert!(!output.contains("beta [x]"));
+        assert!(output.contains("1 marked"));
+        for control in [
+            "Space Mark",
+            "V Visual",
+            "a All",
+            "c Clear",
+            "Esc Clear",
+            "R Refresh",
+        ] {
+            assert!(output.contains(control));
+        }
+        press(&mut app, KeyCode::Char('V'));
+        let output = rendered(&app, 100, 14);
+        assert!(output.contains("VISUAL"));
+        assert!(output.contains("2 marked"));
+        assert!(output.contains("> beta [x]"));
+        press(&mut app, KeyCode::Esc);
+        let output = rendered(&app, 100, 14);
+        assert!(output.contains("0 marked"));
+        assert!(!output.contains("VISUAL"));
+        assert!(!output.contains("[x]"));
+        app = App::with_inbox_scanner(
+            crate::inbox::scan_inbox(&downloads).unwrap(),
+            root.0.clone(),
+            fail_refresh,
+        );
+        press(&mut app, KeyCode::Char('R'));
+        let output = rendered(&app, 100, 14);
+        assert!(output.contains("Inbox refresh failed; entries may be stale"));
+        assert!(output.contains("> alpha"));
+    }
+    #[test]
+    fn ignored_view_advertises_only_restore_and_unreadable_state_warning_persists() {
+        let root = TestDirectory::new();
+        let downloads = root.0.join("Downloads");
+        fs::create_dir(&downloads).unwrap();
+        fs::write(downloads.join("entry"), b"source").unwrap();
+        let mut app = App::new(
+            crate::inbox::scan_inbox(&downloads).unwrap(),
+            root.0.clone(),
+        );
+        let inbox = rendered(&app, 120, 16);
+        assert!(inbox.contains("i Ignore"));
+        assert!(inbox.contains("I Ignored entries"));
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
+        let ignored = rendered(&app, 120, 16);
+        assert!(ignored.contains("Ignored Entries"));
+        assert!(ignored.contains("> entry"));
+        assert!(ignored.contains("u Restore"));
+        assert!(ignored.contains("Space Mark"));
+        assert!(!ignored.contains("Enter Choose"));
+        assert!(!ignored.contains("r Rename"));
+        assert!(!ignored.contains("i Ignore"));
+        press(&mut app, KeyCode::Char('u'));
+        assert!(app.entries().is_empty());
+        press(&mut app, KeyCode::Char('I'));
+        assert!(rendered(&app, 120, 16).contains("> entry"));
+
+        fs::write(
+            root.0.join(".local/state/downloads-janitor/ignored-v1"),
+            b"corrupt",
+        )
+        .unwrap();
+        press(&mut app, KeyCode::Char('R'));
+        press(&mut app, KeyCode::Down);
+        let warning = rendered(&app, 120, 18);
+        assert!(warning.contains("Ignored state unreadable; showing all entries"));
+        assert!(warning.contains("> entry"));
     }
 }

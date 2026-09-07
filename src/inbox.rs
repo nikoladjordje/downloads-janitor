@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::Result;
+use crate::{Result, move_execution::SourceIdentity};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum EntryKind {
@@ -15,6 +15,7 @@ pub enum EntryKind {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct InboxEntry {
+    identity: Option<SourceIdentity>,
     name: OsString,
     path: PathBuf,
     kind: EntryKind,
@@ -25,6 +26,9 @@ impl InboxEntry {
     #[cfg(test)]
     pub(crate) fn test_entry(path: PathBuf, kind: EntryKind, is_symlink: bool) -> Self {
         Self {
+            identity: fs::symlink_metadata(&path)
+                .ok()
+                .map(|metadata| SourceIdentity::from_metadata(&metadata)),
             name: path.file_name().unwrap().to_os_string(),
             path,
             kind,
@@ -35,6 +39,7 @@ impl InboxEntry {
     #[cfg(test)]
     pub(crate) fn test_file(name: &str) -> Self {
         Self {
+            identity: None,
             name: OsString::from(name),
             path: PathBuf::from(name),
             kind: EntryKind::File,
@@ -45,6 +50,7 @@ impl InboxEntry {
     #[cfg(test)]
     pub(crate) fn test_directory(name: &str) -> Self {
         Self {
+            identity: None,
             name: OsString::from(name),
             path: PathBuf::from(name),
             kind: EntryKind::Directory,
@@ -55,11 +61,24 @@ impl InboxEntry {
     #[cfg(test)]
     pub(crate) fn test_symlink(name: &str, kind: EntryKind) -> Self {
         Self {
+            identity: None,
             name: OsString::from(name),
             path: PathBuf::from(name),
             kind,
             is_symlink: true,
         }
+    }
+
+    pub(crate) fn identity(&self) -> Option<SourceIdentity> {
+        self.identity
+    }
+
+    pub(crate) fn set_path(&mut self, path: PathBuf) {
+        self.name = path
+            .file_name()
+            .expect("Inbox Entry has a basename")
+            .to_os_string();
+        self.path = path;
     }
 
     pub fn is_directory(&self) -> bool {
@@ -127,7 +146,8 @@ pub(crate) fn scan_inbox(path: &Path) -> Result<Vec<InboxEntry>> {
     let mut entries = directory
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
-            let is_symlink = entry.file_type().ok()?.is_symlink();
+            let entry_metadata = fs::symlink_metadata(entry.path()).ok()?;
+            let is_symlink = entry_metadata.is_symlink();
             // `metadata` follows symlinks, so links are classified by their targets
             // while the entry's own name and path remain visible in the inbox.
             let metadata = fs::metadata(entry.path()).ok()?;
@@ -140,6 +160,7 @@ pub(crate) fn scan_inbox(path: &Path) -> Result<Vec<InboxEntry>> {
             };
 
             Some(InboxEntry {
+                identity: Some(SourceIdentity::from_metadata(&entry_metadata)),
                 name: entry.file_name(),
                 path: entry.path(),
                 kind,
@@ -148,12 +169,16 @@ pub(crate) fn scan_inbox(path: &Path) -> Result<Vec<InboxEntry>> {
         })
         .collect::<Vec<_>>();
 
+    sort_entries(&mut entries);
+    Ok(entries)
+}
+
+pub(crate) fn sort_entries(entries: &mut [InboxEntry]) {
     entries.sort_by(|left, right| {
         left.kind
             .cmp(&right.kind)
             .then_with(|| left.name.cmp(&right.name))
     });
-    Ok(entries)
 }
 
 #[cfg(test)]
