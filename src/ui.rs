@@ -14,10 +14,244 @@ use crate::{
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     match app.screen() {
         Screen::Inbox => render_inbox(frame, app),
+        Screen::TrashPreview => render_trash(frame, app),
+        Screen::DeleteConfirmation => render_delete(frame, app),
+        Screen::BulkPreview | Screen::BulkProgress | Screen::BulkResult => render_batch(frame, app),
         Screen::DestinationBrowser => render_destination(frame, app),
         Screen::MovePreview | Screen::RenamePreview => render_preview(frame, app),
         Screen::RenameEditor | Screen::MoveNameEditor => render_rename_editor(frame, app),
     }
+}
+
+fn render_delete(frame: &mut Frame<'_>, app: &App) {
+    let areas = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Fill(1),
+        Constraint::Length(5),
+    ])
+    .split(frame.area());
+    frame.render_widget(Paragraph::new("Permanently delete 1 entry. Bypasses Trash.\nRemoves ALL contents of selected directories. Cannot be undone.")
+        .style(Style::default().fg(Color::Red))
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(Block::bordered().title("Permanent Deletion Confirmation")), areas[0]);
+    let review = app
+        .delete_review
+        .as_ref()
+        .expect("Delete confirmation has a review");
+    let content = format!(
+        "Source: {:?}\n{}",
+        review.source,
+        app.move_error().unwrap_or("No deletion authorized")
+    );
+    let max_scroll = content
+        .lines()
+        .count()
+        .saturating_sub(usize::from(areas[1].height.saturating_sub(2)));
+    frame.render_widget(
+        Paragraph::new(content)
+            .scroll((
+                app.batch_scroll.0.min(max_scroll) as u16,
+                app.batch_scroll.1,
+            ))
+            .block(Block::bordered()),
+        areas[1],
+    );
+    frame.render_widget(Paragraph::new(format!("Type exactly delete, then Enter: {:?}\nEsc Cancel; Backspace Edit; Ctrl+u Clear\nArrows Scroll/pan path and errors; Home Start", app.delete_confirmation))
+        .wrap(ratatui::widgets::Wrap { trim: false }).block(Block::bordered()), areas[2]);
+}
+
+fn render_trash(frame: &mut Frame<'_>, app: &App) {
+    let areas = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Fill(1),
+        Constraint::Length(4),
+    ])
+    .split(frame.area());
+    frame.render_widget(
+        Paragraph::new("Send 1 entry to desktop Trash; recover through your file manager")
+            .block(Block::bordered().title("Trash Preview")),
+        areas[0],
+    );
+    let review = app
+        .trash_review
+        .as_ref()
+        .expect("Trash preview has a review");
+    let content = format!(
+        "Source: {:?}\nAction: Send to Trash (including directory contents)\n{}",
+        review.source,
+        app.move_error().unwrap_or("Ready for review")
+    );
+    let max_scroll = content
+        .lines()
+        .count()
+        .saturating_sub(usize::from(areas[1].height.saturating_sub(2)));
+    frame.render_widget(
+        Paragraph::new(content)
+            .scroll((
+                app.batch_scroll.0.min(max_scroll) as u16,
+                app.batch_scroll.1,
+            ))
+            .block(Block::bordered()),
+        areas[1],
+    );
+    frame.render_widget(Paragraph::new("Enter Send to Trash (changes filesystem)    Esc Cancel    q Quit\nj/k Scroll; h/l Pan exact path and errors; Home Start")
+        .wrap(ratatui::widgets::Wrap { trim: false }).block(Block::bordered()), areas[2]);
+}
+
+pub(crate) fn batch_lines(app: &App) -> Vec<String> {
+    let batch = app.batch().expect("batch screen has a batch");
+    let mut lines = Vec::new();
+    for (index, item) in batch.entries.iter().enumerate() {
+        let status = match &item.outcome {
+            crate::batch::EntryOutcome::Completed => "Completed".to_owned(),
+            crate::batch::EntryOutcome::Failed(error) => format!("Failed: {error}"),
+            crate::batch::EntryOutcome::Unattempted => if app.screen() == Screen::BulkPreview {
+                if item.problems.is_empty() {
+                    "Valid"
+                } else {
+                    "Blocked"
+                }
+            } else {
+                "Unattempted"
+            }
+            .to_owned(),
+        };
+        lines.push(format!("{}. {status}", index + 1));
+        lines.push(format!("From: {:?}", item.entry.path()));
+        if let Some(proposal) = &item.proposal {
+            lines.push(format!("To:   {:?}", proposal.resulting_path()));
+        } else {
+            lines.push(
+                match batch.action {
+                    crate::batch::BatchAction::Trash(_) => "Action: Send to desktop Trash",
+                    _ => "Action: Permanently delete; directory contents included",
+                }
+                .to_owned(),
+            );
+        }
+        lines.extend(item.problems.iter().map(|error| format!("  {error}")));
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn render_batch(frame: &mut Frame<'_>, app: &App) {
+    let batch = app.batch().expect("batch exists");
+    let (title, guidance) = match (&batch.action, app.screen()) {
+        (crate::batch::BatchAction::Trash(_), Screen::BulkPreview) => (
+            "Bulk Trash Preview",
+            "Enter rechecks all and sends to Trash if valid. Esc Cancel; q Quit",
+        ),
+        (crate::batch::BatchAction::Delete, Screen::BulkPreview) => (
+            "Bulk Permanent Deletion Confirmation",
+            "Bypasses Trash; removes ALL directory contents. Cannot be undone. Esc Cancel",
+        ),
+        (crate::batch::BatchAction::Trash(_), Screen::BulkProgress) => (
+            "Trashing Entries",
+            "Esc stops before next entry; completed entries stay in Trash",
+        ),
+        (crate::batch::BatchAction::Delete, Screen::BulkProgress) => (
+            "Permanently Deleting Entries",
+            "Esc stops before next entry; completed deletions cannot be undone",
+        ),
+        (crate::batch::BatchAction::Trash(_), _) => (
+            "Bulk Trash Results",
+            "Enter/Esc Inbox; q Quit. Restore completed entries through your file manager",
+        ),
+        (crate::batch::BatchAction::Delete, _) => (
+            "Bulk Permanent Deletion Results",
+            "Enter/Esc Inbox; q Quit. Completed deletions cannot be replayed or undone",
+        ),
+        (_, Screen::BulkPreview) => (
+            "Bulk Move Preview",
+            if batch.valid() {
+                "Enter moves the entire reviewed set and changes the filesystem. Esc Back; q Quit"
+            } else {
+                "Blocked. Enter rechecks all and moves if valid (changes filesystem). Esc Back; q Quit"
+            },
+        ),
+        (_, Screen::BulkProgress) => (
+            "Moving Entries",
+            "Esc Stop before the next entry; completed moves are kept",
+        ),
+        _ => (
+            "Bulk Move Results",
+            "Enter/Esc Inbox; q Quit. Completed moves cannot be replayed",
+        ),
+    };
+    let areas = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Fill(1),
+        Constraint::Length(
+            if batch.action == crate::batch::BatchAction::Delete
+                && app.screen() == Screen::BulkPreview
+            {
+                7
+            } else {
+                4
+            },
+        ),
+    ])
+    .split(frame.area());
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} entries; {}\n{}",
+            batch.entries.len(),
+            batch.summary(),
+            app.notice()
+                .unwrap_or(if batch.action == crate::batch::BatchAction::Move {
+                    "Basenames preserved; execution order: source path bytes"
+                } else {
+                    "Execution order: source path bytes; stop on first failure, no rollback"
+                })
+        ))
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(Block::bordered().title(title)),
+        areas[0],
+    );
+    let lines = batch_lines(app);
+    let max_scroll = lines
+        .len()
+        .saturating_sub(usize::from(areas[1].height.saturating_sub(2)));
+    let scroll = if app.screen() == Screen::BulkProgress {
+        batch
+            .entries
+            .iter()
+            .take_while(|item| item.outcome == crate::batch::EntryOutcome::Completed)
+            .count()
+            * 4
+    } else {
+        app.batch_scroll.0
+    }
+    .min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(scroll)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .scroll((0, app.batch_scroll.1))
+        .block(Block::bordered()),
+        areas[1],
+    );
+    let controls = if batch.action == crate::batch::BatchAction::Delete
+        && app.screen() == Screen::BulkPreview
+    {
+        format!(
+            "Type exactly delete, then Enter: {:?}\nBackspace Edit; Ctrl+u Clear; Arrows Scroll/pan; PgUp/PgDn Page; Home Start",
+            app.delete_confirmation
+        )
+    } else {
+        "j/k ↑/↓ Scroll; PgUp/PgDn Page; h/l ←/→ Pan paths; Home Start".into()
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{guidance}\n{controls}"))
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::bordered()),
+        areas[2],
+    );
 }
 
 fn render_inbox(frame: &mut Frame<'_>, app: &App) {
@@ -92,7 +326,7 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(if app.viewing_ignored() {
             "j/k ↑/↓ Navigate  gg Top  G Bottom  u Restore  I Inbox  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\nR Refresh"
         } else {
-            "j/k ↑/↓ Navigate  gg Top  G Bottom  Enter Choose  r Rename  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\ni Ignore  I Ignored entries  R Refresh"
+            "j/k ↑/↓ Navigate  gg Top  G Bottom  Enter Choose  r Rename  t Trash  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\ni Ignore  I Ignored entries  R Refresh  D Delete permanently"
         })
         .alignment(Alignment::Right)
         .block(Block::default().borders(Borders::ALL)),
@@ -275,6 +509,54 @@ mod tests {
     };
 
     use super::render;
+
+    #[test]
+    fn delete_confirmation_renders_exact_path_warning_and_empty_consent() {
+        let fixture = TestDirectory::new();
+        fs::create_dir(fixture.0.join("Downloads")).unwrap();
+        let source = fixture.0.join("Downloads/review me.txt");
+        fs::write(&source, b"keep").unwrap();
+        let mut app = App::new(
+            crate::inbox::scan_inbox(&fixture.0.join("Downloads")).unwrap(),
+            fixture.0.clone(),
+        );
+        assert!(rendered(&app, 110, 18).contains("D Delete permanently"));
+        press(&mut app, KeyCode::Char('D'));
+        let output = rendered(&app, 150, 18);
+        assert!(output.contains("Permanent Deletion Confirmation"));
+        assert!(output.contains("Permanently delete 1 entry. Bypasses Trash."));
+        assert!(output.contains("Removes ALL contents of selected directories. Cannot be undone."));
+        assert!(output.contains(&format!("Source: {source:?}")));
+        assert!(output.contains("Type exactly delete, then Enter: \"\""));
+        assert!(output.contains("Esc Cancel"));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(rendered(&app, 150, 18).contains("Enter: \"q\""));
+        assert!(source.exists());
+        press(&mut app, KeyCode::Esc);
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn trash_preview_shows_exact_path_and_separate_authorization() {
+        let fixture = TestDirectory::new();
+        fs::create_dir(fixture.0.join("Downloads")).unwrap();
+        let source = fixture.0.join("Downloads/review me.txt");
+        fs::write(&source, b"review").unwrap();
+        let mut app = App::new(
+            crate::inbox::scan_inbox(&fixture.0.join("Downloads")).unwrap(),
+            fixture.0.clone(),
+        );
+        assert!(rendered(&app, 110, 16).contains("t Trash"));
+        press(&mut app, KeyCode::Char('t'));
+        let output = rendered(&app, 150, 16);
+        assert!(output.contains("Trash Preview"));
+        assert!(output.contains(&format!("Source: {source:?}")));
+        assert!(output.contains("Enter Send to Trash (changes filesystem)"));
+        assert!(output.contains("Esc Cancel"));
+        assert!(source.exists());
+        press(&mut app, KeyCode::Esc);
+        assert!(source.exists());
+    }
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -658,5 +940,145 @@ mod tests {
         let warning = rendered(&app, 120, 18);
         assert!(warning.contains("Ignored state unreadable; showing all entries"));
         assert!(warning.contains("> entry"));
+    }
+    #[test]
+    fn removal_review_scrolls_all_paths_and_shows_action_confirmation_and_results() {
+        for delete in [false, true] {
+            let root = TestDirectory::new();
+            let downloads = root.0.join("Downloads");
+            fs::create_dir(&downloads).unwrap();
+            for index in 0..20 {
+                fs::write(downloads.join(format!("entry-{index:02}")), b"data").unwrap();
+            }
+            let mut app = App::new(
+                crate::inbox::scan_inbox(&downloads).unwrap(),
+                root.0.clone(),
+            );
+            app.trash_root = root.0.join("Trash");
+            press(&mut app, KeyCode::Char('a'));
+            press(&mut app, KeyCode::Char(if delete { 'D' } else { 't' }));
+            let output = rendered(&app, 150, 22);
+            assert!(output.contains(if delete {
+                "Bulk Permanent Deletion Confirmation"
+            } else {
+                "Bulk Trash Preview"
+            }));
+            assert!(output.contains("20 entries"));
+            assert!(output.contains("entry-00"));
+            if delete {
+                assert!(
+                    output.contains(
+                        "Bypasses Trash; removes ALL directory contents. Cannot be undone."
+                    )
+                );
+                assert!(output.contains("Type exactly delete, then Enter:"));
+            } else {
+                assert!(output.contains("Enter rechecks all and sends to Trash if valid"));
+            }
+            for _ in 0..8 {
+                press(&mut app, KeyCode::PageDown);
+            }
+            assert!(
+                rendered(&app, 150, 22)
+                    .contains(&format!("From: {:?}", downloads.join("entry-19")))
+            );
+            press(&mut app, KeyCode::Home);
+            assert!(rendered(&app, 150, 22).contains("entry-00"));
+            if delete {
+                for character in "delete".chars() {
+                    press(&mut app, KeyCode::Char(character));
+                }
+            }
+            press(&mut app, KeyCode::Enter);
+            assert!(rendered(&app, 150, 22).contains(if delete {
+                "Permanently Deleting Entries"
+            } else {
+                "Trashing Entries"
+            }));
+            press(&mut app, KeyCode::Esc);
+            let output = rendered(&app, 150, 22);
+            assert!(output.contains(if delete {
+                "Bulk Permanent Deletion Results"
+            } else {
+                "Bulk Trash Results"
+            }));
+            assert!(output.contains("0 completed, 0 failed, 20 unattempted"));
+            assert!(!app.trash_root.exists());
+        }
+    }
+
+    #[test]
+    fn bulk_review_scrolls_every_exact_path_and_shows_blocking_reason() {
+        let root = TestDirectory::new();
+        let downloads = root.0.join("Downloads");
+        fs::create_dir(&downloads).unwrap();
+        for index in 0..20 {
+            fs::write(downloads.join(format!("entry-{index:02}")), b"data").unwrap();
+        }
+        fs::write(root.0.join("entry-19"), b"occupied").unwrap();
+        let mut app = App::new(
+            crate::inbox::scan_inbox(&downloads).unwrap(),
+            root.0.clone(),
+        );
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        let text = rendered(&app, 140, 18);
+        assert!(text.contains("Bulk Move Preview"));
+        assert!(text.contains("20 entries"));
+        assert!(text.contains("entry-00"));
+        assert!(!text.contains("entry-19"));
+        assert!(text.contains("Blocked. Enter rechecks all and moves if valid"));
+        for _ in 0..8 {
+            press(&mut app, KeyCode::PageDown);
+        }
+        let text = rendered(&app, 140, 18);
+        assert!(text.contains("20. Blocked"));
+        assert!(text.contains(&format!("From: {:?}", downloads.join("entry-19"))));
+        assert!(text.contains(&format!("To:   {:?}", root.0.join("entry-19"))));
+        assert!(text.contains("already exists"));
+        press(&mut app, KeyCode::Home);
+        assert!(rendered(&app, 140, 18).contains("entry-00"));
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Right);
+        }
+        assert_ne!(rendered(&app, 50, 18), {
+            press(&mut app, KeyCode::Home);
+            rendered(&app, 50, 18)
+        });
+        assert_eq!(crate::inbox::scan_inbox(&downloads).unwrap().len(), 20);
+    }
+
+    #[test]
+    fn bulk_progress_and_cancelled_results_explain_outcomes() {
+        let root = TestDirectory::new();
+        let downloads = root.0.join("Downloads");
+        fs::create_dir(&downloads).unwrap();
+        for name in ["a", "b"] {
+            fs::write(downloads.join(name), b"data").unwrap();
+        }
+        let mut app = App::new(
+            crate::inbox::scan_inbox(&downloads).unwrap(),
+            root.0.clone(),
+        );
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Char('d'),
+            KeyCode::Enter,
+        ] {
+            press(&mut app, code);
+        }
+        let text = rendered(&app, 140, 20);
+        assert!(text.contains("Moving Entries"));
+        assert!(text.contains("Esc Stop before the next entry"));
+        press(&mut app, KeyCode::Esc);
+        let text = rendered(&app, 140, 20);
+        assert!(text.contains("Bulk Move Results"));
+        assert!(text.contains("0 completed, 0 failed, 2 unattempted"));
+        assert!(text.contains("stopped"));
+        assert!(text.contains("Completed moves cannot be replayed"));
+        assert!(text.contains("1. Unattempted"));
+        assert!(text.contains("2. Unattempted"));
     }
 }

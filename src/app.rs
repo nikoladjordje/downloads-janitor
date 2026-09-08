@@ -8,6 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 
 use crate::{
     Result,
+    batch::{Batch, BatchAction, EntryOutcome},
     destination::{DestinationBrowser, DestinationEntry},
     filename_editor::FilenameEditor,
     ignored_entries::IgnoredEntries,
@@ -24,14 +25,26 @@ type InboxScanner = fn(&Path) -> Result<Vec<InboxEntry>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Screen {
     Inbox,
+    TrashPreview,
+    DeleteConfirmation,
     DestinationBrowser,
     MovePreview,
     RenameEditor,
     MoveNameEditor,
     RenamePreview,
+    BulkPreview,
+    BulkProgress,
+    BulkResult,
 }
 
 pub struct App {
+    pub(crate) delete_review: Option<crate::permanent_delete::DeleteReview>,
+    pub(crate) delete_confirmation: String,
+    pub(crate) trash_review: Option<crate::trash::TrashReview>,
+    pub(crate) trash_root: PathBuf,
+    batch: Option<Batch>,
+    bulk_targets: Vec<InboxEntry>,
+    pub(crate) batch_scroll: (usize, u16),
     entries: Vec<InboxEntry>,
     other_entries: Vec<InboxEntry>,
     ignored: IgnoredEntries,
@@ -69,6 +82,16 @@ impl App {
         let selection = Selection::new(entries.len());
         let inbox_path = home.join("Downloads");
         Self {
+            delete_review: None,
+            delete_confirmation: String::new(),
+            trash_review: None,
+            trash_root: crate::trash::home_trash(
+                &home,
+                std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+            ),
+            batch: None,
+            bulk_targets: Vec::new(),
+            batch_scroll: (0, 0),
             entries,
             other_entries,
             ignored,
@@ -160,6 +183,20 @@ impl App {
                 .draw(|frame| ui::render(frame, &self))
                 .map_err(|error| contextual_io_error("failed to render interface", error))?;
 
+            if self.screen == Screen::BulkProgress {
+                // Render progress before polling input and processing the next entry.
+                // Drain queued navigation/Enter events so they cannot mask a queued Esc.
+                while event::poll(std::time::Duration::ZERO)? {
+                    self.handle_event(event::read()?);
+                    if self.screen != Screen::BulkProgress {
+                        break;
+                    }
+                }
+                if self.screen == Screen::BulkProgress {
+                    self.advance_batch();
+                }
+                continue;
+            }
             let event = event::read()
                 .map_err(|error| contextual_io_error("failed to read terminal event", error))?;
             self.handle_event(event);
@@ -174,6 +211,17 @@ impl App {
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
         {
+            if matches!(
+                self.screen,
+                Screen::BulkPreview | Screen::BulkProgress | Screen::BulkResult
+            ) {
+                self.handle_batch_key(key);
+                return;
+            }
+            if self.screen == Screen::DeleteConfirmation {
+                self.handle_delete_key(key);
+                return;
+            }
             self.notice = None;
             if matches!(self.screen, Screen::RenameEditor | Screen::MoveNameEditor) {
                 self.handle_rename_editor(key);
@@ -184,6 +232,64 @@ impl App {
             }
             match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('D') if self.screen == Screen::Inbox && !self.viewing_ignored => {
+                    if self.marks.count() > 1 {
+                        self.start_removal_batch(BatchAction::Delete);
+                        return;
+                    }
+                    if self.prepare_individual_action() {
+                        match crate::permanent_delete::DeleteReview::new(
+                            &self.entries[self.selected().unwrap()],
+                        ) {
+                            Ok(review) => {
+                                self.delete_review = Some(review);
+                                self.delete_confirmation.clear();
+                                self.move_error = None;
+                                self.batch_scroll = (0, 0);
+                                self.screen = Screen::DeleteConfirmation;
+                            }
+                            Err(error) => self.notice = Some(format!("Cannot delete: {error}")),
+                        }
+                    }
+                }
+                KeyCode::Char('t') if self.screen == Screen::Inbox && !self.viewing_ignored => {
+                    if self.marks.count() > 1 {
+                        self.start_removal_batch(BatchAction::Trash(self.trash_root.clone()));
+                        return;
+                    }
+                    if self.prepare_individual_action() {
+                        match crate::trash::TrashReview::new(
+                            &self.entries[self.selected().unwrap()],
+                        ) {
+                            Ok(review) => {
+                                self.trash_review = Some(review);
+                                self.move_error = None;
+                                self.batch_scroll = (0, 0);
+                                self.screen = Screen::TrashPreview;
+                            }
+                            Err(error) => self.notice = Some(format!("Cannot trash: {error}")),
+                        }
+                    }
+                }
+                KeyCode::Esc if self.screen == Screen::TrashPreview => {
+                    self.trash_review = None;
+                    self.move_error = None;
+                    self.screen = Screen::Inbox;
+                }
+                KeyCode::Enter if self.screen == Screen::TrashPreview => self.attempt_trash(),
+                KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::TrashPreview => {
+                    self.batch_scroll.0 = self.batch_scroll.0.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up if self.screen == Screen::TrashPreview => {
+                    self.batch_scroll.0 = self.batch_scroll.0.saturating_sub(1);
+                }
+                KeyCode::Char('l') | KeyCode::Right if self.screen == Screen::TrashPreview => {
+                    self.batch_scroll.1 = self.batch_scroll.1.saturating_add(8);
+                }
+                KeyCode::Char('h') | KeyCode::Left if self.screen == Screen::TrashPreview => {
+                    self.batch_scroll.1 = self.batch_scroll.1.saturating_sub(8);
+                }
+                KeyCode::Home if self.screen == Screen::TrashPreview => self.batch_scroll = (0, 0),
                 KeyCode::Char('I') if self.screen == Screen::Inbox => self.toggle_ignored_view(),
                 KeyCode::Char('i') if self.screen == Screen::Inbox && !self.viewing_ignored => {
                     self.change_ignored(true)
@@ -221,6 +327,20 @@ impl App {
                         && !self.viewing_ignored
                         && self.selected().is_some() =>
                 {
+                    if self.marks.count() > 1 {
+                        self.marks.exit_visual();
+                        self.bulk_targets = self
+                            .entries
+                            .iter()
+                            .filter(|entry| self.marked(entry))
+                            .cloned()
+                            .collect();
+                        self.destination_browser.refresh();
+                        self.screen = Screen::DestinationBrowser;
+                        return;
+                    }
+                    self.bulk_targets.clear();
+                    self.batch = None;
                     if !self.prepare_individual_action() {
                         return;
                     }
@@ -240,6 +360,16 @@ impl App {
                     self.destination_browser.enter_selected();
                 }
                 KeyCode::Char('d') if self.screen == Screen::DestinationBrowser => {
+                    if !self.bulk_targets.is_empty() {
+                        self.batch = Some(Batch::new(
+                            self.bulk_targets.clone(),
+                            self.destination_browser.current(),
+                            self.inbox_path.parent().expect("Inbox has HOME parent"),
+                        ));
+                        self.batch_scroll = (0, 0);
+                        self.screen = Screen::BulkPreview;
+                        return;
+                    }
                     self.proposed_move = self.build_move_proposal();
                     if self.proposed_move.is_some() {
                         self.screen = Screen::MovePreview;
@@ -302,10 +432,15 @@ impl App {
                             Screen::DestinationBrowser => {
                                 self.destination_browser.move_to_first();
                             }
-                            Screen::MovePreview
+                            Screen::DeleteConfirmation
+                            | Screen::TrashPreview
+                            | Screen::MovePreview
                             | Screen::RenameEditor
                             | Screen::MoveNameEditor
-                            | Screen::RenamePreview => {}
+                            | Screen::RenamePreview
+                            | Screen::BulkPreview
+                            | Screen::BulkProgress
+                            | Screen::BulkResult => {}
                         }
                         self.pending_g = false;
                     } else {
@@ -329,6 +464,154 @@ impl App {
                 self.marks.extend(self.selected(), &self.entries);
             }
         }
+    }
+
+    pub(crate) fn batch(&self) -> Option<&Batch> {
+        self.batch.as_ref()
+    }
+
+    fn start_removal_batch(&mut self, action: BatchAction) {
+        self.marks.exit_visual();
+        let targets = self
+            .entries
+            .iter()
+            .filter(|entry| self.marked(entry))
+            .cloned()
+            .collect();
+        self.batch = Some(Batch::removal(targets, action));
+        self.batch_scroll = (0, 0);
+        self.delete_confirmation.clear();
+        self.screen = Screen::BulkPreview;
+    }
+
+    fn handle_batch_key(&mut self, key: KeyEvent) {
+        let code = key.code;
+        if self.screen == Screen::BulkProgress {
+            if code == KeyCode::Esc {
+                self.batch.as_mut().expect("batch exists").stop();
+                self.finish_batch();
+            }
+            return;
+        }
+        let deleting = self
+            .batch
+            .as_ref()
+            .is_some_and(|batch| batch.action == BatchAction::Delete);
+        if self.screen == Screen::BulkPreview && deleting {
+            match code {
+                KeyCode::Enter if self.delete_confirmation != "delete" => {
+                    self.notice = Some("Type exactly delete, then Enter; Esc cancels".into());
+                    return;
+                }
+                KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                    self.delete_confirmation.clear();
+                    return;
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.delete_confirmation.push(character);
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.delete_confirmation.pop();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        match code {
+            KeyCode::Enter if self.screen == Screen::BulkPreview => {
+                self.delete_confirmation.clear();
+                self.notice = None;
+                let batch = self.batch.as_mut().expect("batch exists");
+                batch.authorize();
+                self.batch_scroll = (0, 0);
+                if batch.running {
+                    self.screen = Screen::BulkProgress;
+                }
+            }
+            KeyCode::Esc if self.screen == Screen::BulkPreview => {
+                self.delete_confirmation.clear();
+                if self.batch.as_ref().expect("batch exists").action == BatchAction::Move {
+                    self.screen = Screen::DestinationBrowser;
+                } else {
+                    self.screen = Screen::Inbox;
+                    self.batch = None;
+                }
+            }
+            KeyCode::Enter | KeyCode::Esc if self.screen == Screen::BulkResult => {
+                self.screen = Screen::Inbox;
+                self.batch = None;
+                self.bulk_targets.clear();
+            }
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.batch_scroll.0 = self.batch_scroll.0.saturating_add(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.batch_scroll.0 = self.batch_scroll.0.saturating_sub(1)
+            }
+            KeyCode::PageDown => self.batch_scroll.0 = self.batch_scroll.0.saturating_add(10),
+            KeyCode::PageUp => self.batch_scroll.0 = self.batch_scroll.0.saturating_sub(10),
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.batch_scroll.1 = self.batch_scroll.1.saturating_sub(8)
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.batch_scroll.1 = self.batch_scroll.1.saturating_add(8)
+            }
+            KeyCode::Home => self.batch_scroll = (0, 0),
+            _ => {}
+        }
+    }
+
+    fn advance_batch(&mut self) {
+        let batch = self.batch.as_mut().expect("batch exists");
+        batch.step();
+        if !batch.running {
+            self.finish_batch();
+        }
+    }
+
+    fn finish_batch(&mut self) {
+        let batch = self.batch.as_ref().expect("batch exists");
+        let summary = batch.summary();
+        let former_index = self.selected().unwrap_or(0);
+        // Consume successful marks even if a path reappears before the refresh.
+        for item in &batch.entries {
+            let current_identity = std::fs::symlink_metadata(item.entry.path())
+                .ok()
+                .map(|metadata| SourceIdentity::from_metadata(&metadata));
+            if item.outcome == EntryOutcome::Completed || current_identity != item.entry.identity()
+            {
+                self.marks.remove(&item.entry);
+            }
+        }
+        match (self.inbox_scanner)(&self.inbox_path) {
+            Ok(entries) => self.replace_inbox_entries(entries),
+            Err(error) => {
+                self.entries.retain(|entry| {
+                    !batch.entries.iter().any(|item| {
+                        item.outcome == EntryOutcome::Completed
+                            && item.entry.path() == entry.path()
+                            && item.entry.identity() == entry.identity()
+                    })
+                });
+                self.notice = Some(format!(
+                    "{summary}; Inbox refresh failed: {error}. Remaining entries may be stale; R retries from Inbox"
+                ));
+            }
+        }
+        self.marks.retain_present(&self.entries);
+        self.selection
+            .repair_after_removal(former_index, self.entries.len());
+        if self.notice.is_none() {
+            self.notice = Some(summary);
+        }
+        self.screen = Screen::BulkResult;
+        self.batch_scroll = (0, 0);
     }
 
     fn toggle_ignored_view(&mut self) {
@@ -569,6 +852,110 @@ impl App {
         self.proposed_move = None;
         self.source_identity = None;
         self.move_error = None;
+    }
+
+    fn handle_delete_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.delete_review = None;
+                self.delete_confirmation.clear();
+                self.move_error = None;
+                self.screen = Screen::Inbox;
+            }
+            KeyCode::Enter if self.delete_confirmation == "delete" => {
+                // Every attempt, including retry after partial failure, needs fresh typed consent.
+                self.delete_confirmation.clear();
+                self.attempt_delete();
+            }
+            KeyCode::Enter => {
+                if self.move_error.is_none() {
+                    self.move_error = Some("Type exactly delete, then Enter; Esc cancels".into());
+                }
+            }
+            KeyCode::Backspace => {
+                self.delete_confirmation.pop();
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                self.delete_confirmation.clear()
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.delete_confirmation.push(character);
+            }
+            KeyCode::Down => self.batch_scroll.0 = self.batch_scroll.0.saturating_add(1),
+            KeyCode::Up => self.batch_scroll.0 = self.batch_scroll.0.saturating_sub(1),
+            KeyCode::Right => self.batch_scroll.1 = self.batch_scroll.1.saturating_add(8),
+            KeyCode::Left => self.batch_scroll.1 = self.batch_scroll.1.saturating_sub(8),
+            KeyCode::Home => self.batch_scroll = (0, 0),
+            _ => {}
+        }
+    }
+
+    fn attempt_delete(&mut self) {
+        let review = self
+            .delete_review
+            .as_ref()
+            .expect("Delete confirmation has a review");
+        if let Err(error) = review.execute() {
+            self.move_error = Some(format!("Deletion failed: {error}"));
+            return;
+        }
+        let source = review.source.clone();
+        let index = self.selected().unwrap_or(0);
+        let notice = match (self.inbox_scanner)(&self.inbox_path) {
+            Ok(entries) => {
+                self.replace_inbox_entries(entries);
+                "Permanently deleted 1 entry".to_owned()
+            }
+            Err(error) => {
+                self.entries.retain(|entry| entry.path() != source);
+                format!(
+                    "Permanently deleted 1 entry; Inbox refresh failed: {error}. Remaining entries may be stale; R retries refresh"
+                )
+            }
+        };
+        self.selection
+            .repair_after_removal(index, self.entries.len());
+        self.marks.clear();
+        self.delete_review = None;
+        self.move_error = None;
+        self.screen = Screen::Inbox;
+        self.notice = Some(notice);
+    }
+
+    fn attempt_trash(&mut self) {
+        let review = self
+            .trash_review
+            .as_ref()
+            .expect("Trash preview has a review");
+        if let Err(error) = review.execute(&self.trash_root) {
+            self.move_error = Some(format!("Trash failed: {error}"));
+            return;
+        }
+        let source = review.source.clone();
+        let index = self.selected().unwrap_or(0);
+        let notice = match (self.inbox_scanner)(&self.inbox_path) {
+            Ok(entries) => {
+                self.replace_inbox_entries(entries);
+                "Sent to Trash; restore through your file manager".to_owned()
+            }
+            Err(error) => {
+                self.entries.retain(|entry| entry.path() != source);
+                format!(
+                    "Sent to Trash; Inbox refresh failed: {error}. Remaining entries may be stale; R retries refresh"
+                )
+            }
+        };
+        self.selection
+            .repair_after_removal(index, self.entries.len());
+        self.marks.clear();
+        self.trash_review = None;
+        self.move_error = None;
+        self.screen = Screen::Inbox;
+        self.notice = Some(notice);
     }
 
     fn attempt_rename(&mut self) {
@@ -1342,6 +1729,732 @@ mod tests {
         }
     }
 
+    #[test]
+    fn milestone_four_mixed_workflow_survives_actions_and_restart() {
+        let fixture = RenameFixture::new();
+        fs::create_dir(fixture.0.join("Archive")).unwrap();
+        fs::create_dir(fixture.path("01-bundle")).unwrap();
+        fs::write(fixture.path("01-bundle/contents"), b"nested").unwrap();
+        for name in ["02-rename", "03-move", "04-ignore", "05-trash", "06-delete"] {
+            fs::write(fixture.path(name), name.as_bytes()).unwrap();
+        }
+        let target = fixture.0.join("sentinel");
+        fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, fixture.path("07-link")).unwrap();
+        let mut app = fixture.app();
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('r'));
+        enter_rename_name(&mut app, "02-renamed-q");
+        press(&mut app, KeyCode::Enter);
+        assert!(fixture.path("02-rename").exists()); // preview is read-only
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.entries()[app.selected().unwrap()].path(),
+            fixture.path("02-renamed-q")
+        );
+        assert!(!app.should_quit);
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter); // first HOME directory is Archive
+        press(&mut app, KeyCode::Char('d'));
+        edit_move_name(&mut app, "03-moved-q");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            fs::read(fixture.0.join("Archive/03-moved-q")).unwrap(),
+            b"03-move"
+        );
+        assert_eq!(
+            app.entries()[app.selected().unwrap()].path(),
+            fixture.path("04-ignore")
+        );
+
+        for code in [
+            KeyCode::Char('g'),
+            KeyCode::Char('g'),
+            KeyCode::Char('V'),
+            KeyCode::Down,
+            KeyCode::Char('V'),
+            KeyCode::Char('G'),
+            KeyCode::Char(' '),
+        ] {
+            press(&mut app, code);
+        }
+        assert_eq!(app.marked_count(), 3);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.screen(), Screen::Inbox); // rename remains individual
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.destination(), Some(fixture.0.join("Archive").as_path()));
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..3 {
+            app.advance_batch();
+        }
+        assert_eq!(
+            app.batch().unwrap().summary(),
+            "3 completed, 0 failed, 0 unattempted"
+        );
+        assert_eq!(
+            fs::read(fixture.0.join("Archive/01-bundle/contents")).unwrap(),
+            b"nested"
+        );
+        assert_eq!(
+            fs::read(fixture.0.join("Archive/02-renamed-q")).unwrap(),
+            b"02-rename"
+        );
+        assert_eq!(
+            fs::read_link(fixture.0.join("Archive/07-link")).unwrap(),
+            target
+        );
+        assert_eq!(app.marked_count(), 0);
+        press(&mut app, KeyCode::Enter);
+
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('i'));
+        drop(app);
+        let mut app = fixture.app();
+        app.trash_root = fixture.0.join(".local/share/Trash");
+        assert_eq!(app.entries().len(), 2);
+        press(&mut app, KeyCode::Char('I'));
+        assert_eq!(app.entries().len(), 1);
+        assert_eq!(app.entries()[0].path(), fixture.path("04-ignore"));
+        press(&mut app, KeyCode::Char('u'));
+        press(&mut app, KeyCode::Char('I'));
+        assert_eq!(app.entries().len(), 3);
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('t'));
+        assert!(fixture.path("05-trash").exists());
+        press(&mut app, KeyCode::Enter);
+        let payload = fs::read_dir(app.trash_root.join("files"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(payload.path()).unwrap(), b"05-trash");
+        let metadata = fs::read_dir(app.trash_root.join("info"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(
+            fs::read_to_string(metadata.path())
+                .unwrap()
+                .contains("/Downloads/05-trash")
+        );
+        assert_eq!(
+            app.entries()[app.selected().unwrap()].path(),
+            fixture.path("06-delete")
+        );
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Enter);
+        assert!(fixture.path("06-delete").exists());
+        confirm_delete(&mut app);
+        assert!(!fixture.path("06-delete").exists());
+        assert_eq!(app.entries().len(), 1);
+        assert_eq!(
+            app.entries()[app.selected().unwrap()].path(),
+            fixture.path("04-ignore")
+        );
+        assert_eq!(fixture.app().entries().len(), 1);
+        assert_eq!(fs::read(target).unwrap(), b"untouched");
+    }
+
+    fn confirm_delete(app: &mut App) {
+        for character in "delete".chars() {
+            press(app, KeyCode::Char(character));
+        }
+        press(app, KeyCode::Enter);
+    }
+
+    #[test]
+    fn delete_requires_exact_typed_confirmation_and_escape_preserves_mark() {
+        let fixture = RenameFixture::new();
+        fs::write(fixture.path("a"), b"keep").unwrap();
+        let mut app = fixture.app();
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.screen(), Screen::DeleteConfirmation);
+        for input in ["", "Delete", "delete ", "deletex", "q"] {
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            )));
+            for character in input.chars() {
+                press(&mut app, KeyCode::Char(character));
+            }
+            press(&mut app, KeyCode::Enter);
+            assert!(fixture.path("a").exists());
+            assert!(!app.should_quit);
+        }
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert_eq!(app.marked_count(), 1);
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.delete_confirmation.is_empty());
+        for character in "delete".chars() {
+            app.handle_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(fixture.path("a").exists());
+        for character in "deletex".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Backspace);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            app.handle_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                kind,
+            )));
+        }
+        assert!(fixture.path("a").exists());
+        press(&mut app, KeyCode::Enter);
+        assert!(!fixture.path("a").exists());
+        assert_eq!(app.selected(), None);
+        assert_eq!(app.marked_count(), 0);
+    }
+
+    #[test]
+    fn delete_success_repairs_cursor_and_preserves_success_on_refresh_failure() {
+        for failure in [false, true] {
+            let (fixture, mut app) = trash_fixture();
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char(' '));
+            press(&mut app, KeyCode::Down);
+            if failure {
+                app.inbox_scanner = fail_refresh;
+            }
+            press(&mut app, KeyCode::Char('D'));
+            assert_eq!(
+                app.delete_review.as_ref().unwrap().source,
+                fixture.path("b")
+            );
+            confirm_delete(&mut app);
+            assert_eq!(app.screen(), Screen::Inbox);
+            assert!(!fixture.path("b").exists());
+            assert_eq!(
+                app.entries()[app.selected().unwrap()].path(),
+                fixture.path("c")
+            );
+            assert_eq!(app.marked_count(), 0);
+            assert!(
+                app.notice()
+                    .unwrap()
+                    .contains("Permanently deleted 1 entry")
+            );
+            assert_eq!(app.notice().unwrap().contains("refresh failed"), failure);
+            assert!(!app.trash_root.exists());
+        }
+    }
+
+    #[test]
+    fn delete_refuses_replaced_or_missing_reviewed_source() {
+        for replacement in [None, Some(false), Some(true)] {
+            let fixture = RenameFixture::new();
+            fs::write(fixture.path("a"), b"original").unwrap();
+            let mut app = fixture.app();
+            press(&mut app, KeyCode::Char('D'));
+            fs::rename(fixture.path("a"), fixture.path("original")).unwrap();
+            if let Some(directory) = replacement {
+                if directory {
+                    fs::create_dir(fixture.path("a")).unwrap();
+                } else {
+                    fs::write(fixture.path("a"), b"replacement").unwrap();
+                }
+            }
+            confirm_delete(&mut app);
+            assert_eq!(app.screen(), Screen::DeleteConfirmation);
+            assert!(app.move_error().unwrap().contains("Deletion failed"));
+            assert!(app.delete_confirmation.is_empty());
+            assert_eq!(fs::read(fixture.path("original")).unwrap(), b"original");
+            if replacement.is_some() {
+                assert!(fixture.path("a").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn delete_nonempty_directory_never_follows_nested_symlinks() {
+        let fixture = RenameFixture::new();
+        let target = fixture.0.join("outside");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"keep").unwrap();
+        fs::create_dir_all(fixture.path("folder/nested")).unwrap();
+        fs::write(fixture.path("folder/nested/remove"), b"remove").unwrap();
+        std::os::unix::fs::symlink(&target, fixture.path("folder/link")).unwrap();
+        let mut app = fixture.app();
+        press(&mut app, KeyCode::Char('D'));
+        confirm_delete(&mut app);
+        assert!(!fixture.path("folder").exists());
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
+        assert!(app.entries().is_empty());
+    }
+
+    #[test]
+    fn delete_symlink_entries_preserves_file_and_directory_targets() {
+        for directory in [false, true] {
+            let fixture = RenameFixture::new();
+            let target = fixture.0.join("target");
+            if directory {
+                fs::create_dir(&target).unwrap();
+            } else {
+                fs::write(&target, b"keep").unwrap();
+            }
+            std::os::unix::fs::symlink(&target, fixture.path("link")).unwrap();
+            let mut app = fixture.app();
+            press(&mut app, KeyCode::Char('D'));
+            confirm_delete(&mut app);
+            assert!(fs::symlink_metadata(fixture.path("link")).is_err());
+            assert!(target.exists());
+        }
+    }
+
+    #[test]
+    fn delete_partial_recursive_failure_is_truthful_and_retry_needs_new_consent() {
+        use std::os::unix::fs::PermissionsExt;
+        // An ordinary user can remove contents but cannot unlink the root from this parent.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let fixture = RenameFixture::new();
+        fs::create_dir(fixture.path("folder")).unwrap();
+        fs::write(fixture.path("folder/child"), b"remove").unwrap();
+        let mut app = fixture.app();
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('D'));
+        fs::set_permissions(fixture.path(""), fs::Permissions::from_mode(0o500)).unwrap();
+        confirm_delete(&mut app);
+        fs::set_permissions(fixture.path(""), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(fixture.path("folder").exists());
+        assert!(!fixture.path("folder/child").exists());
+        assert_eq!(app.screen(), Screen::DeleteConfirmation);
+        assert!(
+            app.move_error()
+                .unwrap()
+                .contains("some directory contents may already have been permanently deleted")
+        );
+        assert!(app.delete_confirmation.is_empty());
+        assert_eq!(app.marked_count(), 1);
+        press(&mut app, KeyCode::Enter);
+        assert!(fixture.path("folder").exists());
+        assert!(
+            app.move_error()
+                .unwrap()
+                .contains("some directory contents")
+        );
+        confirm_delete(&mut app);
+        assert!(!fixture.path("folder").exists());
+        assert_eq!(app.screen(), Screen::Inbox);
+    }
+
+    #[test]
+    fn delete_reviews_multiple_marks_and_refuses_ignored_entries() {
+        let (fixture, mut app) = trash_fixture();
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.screen(), Screen::BulkPreview);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert!(fixture.path("a").exists());
+    }
+
+    fn removal_batch_fixture(delete: bool) -> (RenameFixture, App) {
+        let (fixture, mut app) = trash_fixture();
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('G'));
+        press(&mut app, KeyCode::Char(if delete { 'D' } else { 't' }));
+        assert_eq!(app.screen(), Screen::BulkPreview);
+        (fixture, app)
+    }
+
+    fn authorize_removal(app: &mut App, delete: bool) {
+        if delete {
+            confirm_delete(app);
+        } else {
+            press(app, KeyCode::Enter);
+        }
+    }
+
+    #[test]
+    fn removal_batches_preflight_entire_set_and_require_new_consent_after_block() {
+        for delete in [false, true] {
+            let (fixture, mut app) = removal_batch_fixture(delete);
+            assert!(!app.trash_root.exists()); // even preflight creates no Trash storage
+            fs::rename(fixture.path("c"), fixture.0.join("original-c")).unwrap();
+            fs::write(fixture.path("c"), b"replacement").unwrap();
+            authorize_removal(&mut app, delete);
+            assert_eq!(app.screen(), Screen::BulkPreview);
+            assert!(!app.batch().unwrap().entries[2].problems.is_empty());
+            for name in ["a", "b", "c"] {
+                assert!(fixture.path(name).exists());
+            }
+            assert!(app.delete_confirmation.is_empty());
+            assert!(!app.trash_root.exists());
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.marked_count(), 3);
+        }
+    }
+
+    #[test]
+    fn removal_batches_succeed_in_order_and_cannot_replay_results() {
+        for delete in [false, true] {
+            let (fixture, mut app) = removal_batch_fixture(delete);
+            authorize_removal(&mut app, delete);
+            assert_eq!(app.screen(), Screen::BulkProgress);
+            for name in ["a", "b", "c"] {
+                assert!(fixture.path(name).exists());
+                app.advance_batch();
+                assert!(!fixture.path(name).exists());
+            }
+            assert_eq!(app.screen(), Screen::BulkResult);
+            assert_eq!(
+                app.batch().unwrap().summary(),
+                "3 completed, 0 failed, 0 unattempted"
+            );
+            assert_eq!(app.marked_count(), 0);
+            assert_eq!(app.selected(), None);
+            app.batch.as_mut().unwrap().authorize();
+            assert!(!app.batch().unwrap().running);
+            if !delete {
+                assert_eq!(
+                    fs::read_dir(app.trash_root.join("files")).unwrap().count(),
+                    3
+                );
+                assert_eq!(
+                    fs::read_dir(app.trash_root.join("info")).unwrap().count(),
+                    3
+                );
+            }
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.screen(), Screen::Inbox);
+            assert!(app.batch().is_none());
+        }
+    }
+
+    #[test]
+    fn removal_batches_stop_between_entries_and_keep_remaining_marks_on_refresh_failure() {
+        for delete in [false, true] {
+            for completed in [0, 1] {
+                for refresh_failure in [false, true] {
+                    let (fixture, mut app) = removal_batch_fixture(delete);
+                    if refresh_failure {
+                        app.inbox_scanner = fail_refresh;
+                    }
+                    authorize_removal(&mut app, delete);
+                    if completed == 1 {
+                        app.advance_batch();
+                    }
+                    press(&mut app, KeyCode::Esc);
+                    assert_eq!(app.screen(), Screen::BulkResult);
+                    assert_eq!(app.marked_count(), 3 - completed);
+                    assert_eq!(app.entries().len(), 3 - completed);
+                    assert_eq!(fixture.path("a").exists(), completed == 0);
+                    assert!(fixture.path("b").exists());
+                    assert!(fixture.path("c").exists());
+                    assert_eq!(
+                        app.entries()[app.selected().unwrap()].path(),
+                        fixture.path("c")
+                    );
+                    assert!(app.batch().unwrap().summary().contains("stopped"));
+                    assert_eq!(
+                        app.notice().unwrap().contains("refresh failed"),
+                        refresh_failure
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn removal_batches_revalidate_middle_entry_and_retain_only_matching_marks() {
+        for delete in [false, true] {
+            let (fixture, mut app) = removal_batch_fixture(delete);
+            authorize_removal(&mut app, delete);
+            app.advance_batch();
+            fs::rename(fixture.path("b"), fixture.0.join("original-b")).unwrap();
+            fs::write(fixture.path("b"), b"replacement").unwrap();
+            app.advance_batch();
+            assert_eq!(app.screen(), Screen::BulkResult);
+            assert_eq!(
+                app.batch().unwrap().summary(),
+                "1 completed, 1 failed, 1 unattempted"
+            );
+            assert_eq!(fs::read(fixture.path("b")).unwrap(), b"replacement");
+            assert!(fixture.path("c").exists());
+            assert_eq!(app.marked_count(), 1);
+            assert!(
+                app.marked(
+                    app.entries()
+                        .iter()
+                        .find(|e| e.path() == fixture.path("c"))
+                        .unwrap()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_delete_confirmation_is_exact_cancellable_and_ignores_repeats() {
+        let (fixture, mut app) = removal_batch_fixture(true);
+        for text in ["", "Delete", "delete ", "q"] {
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            )));
+            for character in text.chars() {
+                press(&mut app, KeyCode::Char(character));
+            }
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.screen(), Screen::BulkPreview);
+            assert!(!app.should_quit);
+        }
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.marked_count(), 3);
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.delete_confirmation.is_empty());
+        for character in "deletex".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Backspace);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            app.handle_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                kind,
+            )));
+        }
+        assert_eq!(app.screen(), Screen::BulkPreview);
+        assert!(fixture.path("a").exists());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::BulkProgress);
+        press(&mut app, KeyCode::Esc);
+        assert!(fixture.path("a").exists());
+    }
+
+    #[test]
+    fn removal_preflight_blocks_unwritable_parent_and_unavailable_trash() {
+        use std::os::unix::fs::PermissionsExt;
+        for delete in [false, true] {
+            if unsafe { libc::geteuid() } == 0 {
+                continue;
+            }
+            let (fixture, mut app) = removal_batch_fixture(delete);
+            fs::set_permissions(fixture.path(""), fs::Permissions::from_mode(0o500)).unwrap();
+            authorize_removal(&mut app, delete);
+            fs::set_permissions(fixture.path(""), fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(app.screen(), Screen::BulkPreview);
+            assert!(
+                app.batch()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .all(|item| !item.problems.is_empty())
+            );
+            assert!(fixture.path("a").exists());
+        }
+        let (fixture, mut app) = removal_batch_fixture(false);
+        fs::write(&app.trash_root, b"blocked").unwrap();
+        authorize_removal(&mut app, false);
+        assert_eq!(app.screen(), Screen::BulkPreview);
+        assert!(fixture.path("a").exists());
+    }
+
+    #[test]
+    fn removal_runtime_failure_keeps_partial_results_and_surviving_marks() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        for delete in [false, true] {
+            let fixture = RenameFixture::new();
+            fs::write(fixture.path("a"), b"a").unwrap();
+            fs::create_dir(fixture.path("b")).unwrap();
+            fs::write(fixture.path("b/child"), b"child").unwrap();
+            fs::write(fixture.path("c"), b"c").unwrap();
+            let mut app = fixture.app();
+            app.trash_root = fixture.0.join("Trash");
+            press(&mut app, KeyCode::Char('a'));
+            press(&mut app, KeyCode::Char(if delete { 'D' } else { 't' }));
+            authorize_removal(&mut app, delete);
+            app.advance_batch(); // a first, despite directories sorting first in Inbox
+            let denied = if delete {
+                fixture.path("")
+            } else {
+                app.trash_root.join("info")
+            };
+            fs::set_permissions(&denied, fs::Permissions::from_mode(0o500)).unwrap();
+            app.advance_batch();
+            fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(app.screen(), Screen::BulkResult);
+            assert_eq!(
+                app.batch().unwrap().summary(),
+                "1 completed, 1 failed, 1 unattempted"
+            );
+            assert!(fixture.path("b").exists());
+            assert_eq!(fixture.path("b/child").exists(), !delete);
+            assert!(fixture.path("c").exists());
+            assert_eq!(app.marked_count(), 2);
+            let crate::batch::EntryOutcome::Failed(error) =
+                &app.batch().unwrap().entries[1].outcome
+            else {
+                panic!("expected failure")
+            };
+            assert!(error.contains(if delete {
+                "some directory contents"
+            } else {
+                "Trash metadata"
+            }));
+        }
+    }
+
+    #[test]
+    fn removal_batches_preserve_symlink_targets_and_handle_nonempty_directories() {
+        for delete in [false, true] {
+            let fixture = RenameFixture::new();
+            let target = fixture.0.join("outside");
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("keep"), b"keep").unwrap();
+            fs::create_dir(fixture.path("folder")).unwrap();
+            fs::write(fixture.path("folder/child"), b"child").unwrap();
+            std::os::unix::fs::symlink(&target, fixture.path("link")).unwrap();
+            fs::write(fixture.path("file"), b"file").unwrap();
+            let mut app = fixture.app();
+            app.trash_root = fixture.0.join("Trash");
+            press(&mut app, KeyCode::Char('a'));
+            press(&mut app, KeyCode::Char(if delete { 'D' } else { 't' }));
+            authorize_removal(&mut app, delete);
+            while app.screen() == Screen::BulkProgress {
+                app.advance_batch();
+            }
+            assert_eq!(
+                app.batch().unwrap().summary(),
+                "3 completed, 0 failed, 0 unattempted"
+            );
+            assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
+            assert!(app.entries().is_empty());
+            if !delete {
+                let payloads = fs::read_dir(app.trash_root.join("files"))
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect::<Vec<_>>();
+                assert!(
+                    payloads
+                        .iter()
+                        .any(|p| fs::symlink_metadata(p).unwrap().is_symlink())
+                );
+                assert!(
+                    payloads
+                        .iter()
+                        .any(|p| fs::read(p.join("child")).ok().as_deref() == Some(b"child"))
+                );
+            }
+        }
+    }
+
+    fn trash_fixture() -> (RenameFixture, App) {
+        let fixture = RenameFixture::new();
+        for name in ["a", "b", "c"] {
+            fs::write(fixture.path(name), name).unwrap();
+        }
+        let mut app = fixture.app();
+        // Never let the host's XDG_DATA_HOME direct tests into personal Trash.
+        app.trash_root = fixture.0.join("Trash");
+        (fixture, app)
+    }
+
+    #[test]
+    fn trash_review_requires_separate_enter_and_cancellation_preserves_marks() {
+        let (fixture, mut app) = trash_fixture();
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.screen(), Screen::TrashPreview);
+        assert_eq!(app.trash_review.as_ref().unwrap().source, fixture.path("a"));
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            app.handle_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                kind,
+            )));
+        }
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Char('t'));
+        }
+        assert!(fixture.path("a").exists());
+        assert!(!app.trash_root.exists());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert_eq!(app.marked_count(), 1);
+        assert!(fixture.path("a").exists());
+    }
+
+    #[test]
+    fn trash_success_uses_mark_and_repairs_cursor_even_when_refresh_fails() {
+        for failed_refresh in [false, true] {
+            let (fixture, mut app) = trash_fixture();
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char(' ')); // b marked
+            press(&mut app, KeyCode::Down); // cursor c
+            if failed_refresh {
+                app.inbox_scanner = fail_refresh;
+            }
+            press(&mut app, KeyCode::Char('t'));
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.screen(), Screen::Inbox);
+            assert!(!fixture.path("b").exists());
+            assert!(fixture.path("a").exists());
+            assert!(fixture.path("c").exists());
+            assert_eq!(app.entries().len(), 2);
+            assert_eq!(
+                app.entries()[app.selected().unwrap()].path(),
+                fixture.path("c")
+            );
+            assert_eq!(app.marked_count(), 0);
+            let notice = app.notice().unwrap();
+            assert!(notice.contains("Sent to Trash"));
+            assert_eq!(notice.contains("refresh failed"), failed_refresh);
+        }
+    }
+
+    #[test]
+    fn trash_replacement_failure_retains_review_and_selection() {
+        let (fixture, mut app) = trash_fixture();
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('t'));
+        fs::rename(fixture.path("a"), fixture.path("old-a")).unwrap();
+        fs::write(fixture.path("a"), b"replacement").unwrap();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::TrashPreview);
+        assert!(app.move_error().unwrap().contains("changed"));
+        assert_eq!(app.marked_count(), 1);
+        assert_eq!(fs::read(fixture.path("a")).unwrap(), b"replacement");
+        assert!(!app.trash_root.exists());
+    }
+
+    #[test]
+    fn trash_reviews_multiple_marks_and_is_disabled_in_ignored_view() {
+        let (fixture, mut app) = trash_fixture();
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.screen(), Screen::BulkPreview);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('I'));
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert!(fixture.path("a").exists());
+        assert!(!app.trash_root.exists());
+    }
+
     fn enter_rename_name(app: &mut App, name: &str) {
         app.handle_event(Event::Key(KeyEvent::new(
             KeyCode::Char('u'),
@@ -1905,8 +3018,13 @@ mod tests {
             let mut app = fixture.app();
             press(&mut app, KeyCode::Char('a'));
             press(&mut app, action);
-            assert_eq!(app.screen(), Screen::Inbox);
-            assert!(app.notice().unwrap().contains("supports one entry"));
+            if action == KeyCode::Enter {
+                assert_eq!(app.screen(), Screen::DestinationBrowser);
+                press(&mut app, KeyCode::Esc);
+            } else {
+                assert_eq!(app.screen(), Screen::Inbox);
+                assert!(app.notice().unwrap().contains("supports one entry"));
+            }
             press(&mut app, KeyCode::Char('c'));
             press(&mut app, KeyCode::Char(' ')); // a
             press(&mut app, KeyCode::Char('G')); // cursor e
@@ -2180,5 +3298,221 @@ mod tests {
         );
         press(&mut app, KeyCode::Char('I'));
         assert_eq!(app.entries().len(), 1);
+    }
+    fn bulk_fixture() -> (RenameFixture, App) {
+        let fixture = RenameFixture::new();
+        for name in ["c", "a", "b"] {
+            fs::write(fixture.path(name), name).unwrap();
+        }
+        let mut app = fixture.app();
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('G'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.screen(), Screen::BulkPreview);
+        (fixture, app)
+    }
+
+    #[test]
+    fn bulk_preflight_checks_all_entries_before_any_mutation() {
+        let (fixture, mut app) = bulk_fixture();
+        fs::write(fixture.0.join("c"), b"occupied").unwrap();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::BulkPreview);
+        assert!(!app.batch().unwrap().valid());
+        assert!(
+            app.batch().unwrap().entries[2]
+                .problems
+                .iter()
+                .any(|p| p.contains("already exists"))
+        );
+        for name in ["a", "b", "c"] {
+            assert!(fixture.path(name).exists());
+        }
+        assert!(!fixture.0.join("a").exists());
+    }
+
+    #[test]
+    fn bulk_preflight_refuses_replaced_marked_source() {
+        let (fixture, mut app) = bulk_fixture();
+        fs::rename(fixture.path("c"), fixture.0.join("original")).unwrap();
+        fs::write(fixture.path("c"), b"replacement").unwrap();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::BulkPreview);
+        assert!(
+            app.batch().unwrap().entries[2]
+                .problems
+                .iter()
+                .any(|p| p.contains("identity"))
+        );
+        assert!(fixture.path("a").exists());
+    }
+
+    #[test]
+    fn bulk_success_is_ordered_consumes_marks_and_cannot_replay() {
+        let (fixture, mut app) = bulk_fixture();
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.screen(), Screen::BulkPreview); // no bulk basename editor
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::BulkProgress);
+        assert!(fixture.path("a").exists()); // authorization does not skip progress rendering
+        for name in ["a", "b", "c"] {
+            app.advance_batch();
+            assert_eq!(fs::read(fixture.0.join(name)).unwrap(), name.as_bytes());
+            assert!(!fixture.path(name).exists());
+        }
+        assert_eq!(app.screen(), Screen::BulkResult);
+        assert_eq!(
+            app.batch().unwrap().summary(),
+            "3 completed, 0 failed, 0 unattempted"
+        );
+        assert_eq!(app.marked_count(), 0);
+        assert_eq!(app.selected(), None);
+        app.batch.as_mut().unwrap().authorize();
+        assert!(!app.batch().unwrap().running);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::Inbox);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::Inbox);
+    }
+
+    #[test]
+    fn bulk_collision_after_first_move_stops_and_retains_remaining_marks() {
+        let (fixture, mut app) = bulk_fixture();
+        press(&mut app, KeyCode::Enter);
+        app.advance_batch();
+        fs::write(fixture.0.join("b"), b"racer").unwrap();
+        app.advance_batch();
+        assert_eq!(app.screen(), Screen::BulkResult);
+        assert_eq!(
+            app.batch().unwrap().summary(),
+            "1 completed, 1 failed, 1 unattempted"
+        );
+        assert_eq!(marked_names(&app), ["b", "c"]);
+        assert_eq!(app.selected(), Some(1));
+        assert_eq!(fs::read(fixture.0.join("b")).unwrap(), b"racer");
+        assert_eq!(fs::read(fixture.path("b")).unwrap(), b"b");
+        assert!(fixture.path("c").exists());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.batch().unwrap().entries.len(), 2);
+        assert!(
+            app.batch()
+                .unwrap()
+                .entries
+                .iter()
+                .all(|item| item.entry.path() != fixture.path("a"))
+        );
+    }
+
+    #[test]
+    fn bulk_checks_identity_again_between_entries() {
+        let (fixture, mut app) = bulk_fixture();
+        press(&mut app, KeyCode::Enter);
+        app.advance_batch();
+        fs::rename(fixture.path("b"), fixture.0.join("original")).unwrap();
+        fs::write(fixture.path("b"), b"replacement").unwrap();
+        app.advance_batch();
+        assert_eq!(
+            app.batch().unwrap().summary(),
+            "1 completed, 1 failed, 1 unattempted"
+        );
+        assert_eq!(marked_names(&app), ["c"]);
+        assert_eq!(fs::read(fixture.path("b")).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn bulk_escape_stops_before_next_entry_and_keeps_completed_moves() {
+        for completed in [0, 1] {
+            let (fixture, mut app) = bulk_fixture();
+            press(&mut app, KeyCode::Enter);
+            for _ in 0..completed {
+                app.advance_batch();
+            }
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.screen(), Screen::BulkResult);
+            assert!(app.batch().unwrap().stopped);
+            assert_eq!(app.marked_count(), 3 - completed);
+            assert_eq!(fixture.0.join("a").exists(), completed == 1);
+            assert!(fixture.path("b").exists());
+            app.batch.as_mut().unwrap().step();
+            assert!(fixture.path("b").exists());
+        }
+    }
+
+    #[test]
+    fn bulk_refresh_failure_keeps_truthful_results_and_unconsumed_marks() {
+        let (fixture, mut app) = bulk_fixture();
+        app.inbox_scanner = |_| Err(std::io::Error::other("scan denied").into());
+        press(&mut app, KeyCode::Enter);
+        app.advance_batch();
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.notice()
+                .unwrap()
+                .contains("1 completed, 0 failed, 2 unattempted")
+        );
+        assert!(app.notice().unwrap().contains("scan denied"));
+        assert!(app.notice().unwrap().contains("may be stale"));
+        assert_eq!(marked_names(&app), ["b", "c"]);
+        assert_eq!(app.entries().len(), 2);
+        assert_eq!(app.selected(), Some(1));
+        assert!(fixture.0.join("a").exists());
+    }
+
+    #[test]
+    fn bulk_refuses_destination_ancestor_replaced_by_symlink() {
+        let (fixture, mut app) = bulk_fixture();
+        let parent = fixture.0.join("parent");
+        fs::create_dir_all(parent.join("dest")).unwrap();
+        app.batch = Some(crate::batch::Batch::new(
+            app.bulk_targets.clone(),
+            &parent.join("dest"),
+            &fixture.0,
+        ));
+        press(&mut app, KeyCode::Enter);
+        fs::rename(&parent, fixture.0.join("old-parent")).unwrap();
+        std::os::unix::fs::symlink(fixture.0.join("old-parent"), &parent).unwrap();
+        app.advance_batch();
+        assert_eq!(
+            app.batch().unwrap().summary(),
+            "0 completed, 1 failed, 2 unattempted"
+        );
+        assert!(fixture.path("a").exists());
+    }
+    #[test]
+    fn bulk_moves_directories_and_symlink_entries_without_touching_targets() {
+        let fixture = RenameFixture::new();
+        fs::create_dir(fixture.path("z-dir")).unwrap();
+        fs::write(fixture.path("z-dir/contents"), b"nested").unwrap();
+        fs::write(fixture.path("a-file"), b"plain").unwrap();
+        let target = fixture.0.join("target");
+        fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, fixture.path("m-link")).unwrap();
+        let mut app = fixture.app();
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Char('d'),
+            KeyCode::Enter,
+        ] {
+            press(&mut app, code);
+        }
+        app.advance_batch(); // byte order, even though Inbox sorts directories first
+        assert!(fixture.0.join("a-file").exists());
+        assert!(fixture.path("z-dir").exists());
+        app.advance_batch();
+        assert_eq!(fs::read_link(fixture.0.join("m-link")).unwrap(), target);
+        app.advance_batch();
+        assert_eq!(
+            fs::read(fixture.0.join("z-dir/contents")).unwrap(),
+            b"nested"
+        );
+        assert_eq!(fs::read(target).unwrap(), b"untouched");
+        assert_eq!(
+            app.batch().unwrap().summary(),
+            "3 completed, 0 failed, 0 unattempted"
+        );
     }
 }

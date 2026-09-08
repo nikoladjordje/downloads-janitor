@@ -1,10 +1,10 @@
 # Downloads Janitor
 
 Downloads Janitor is a keyboard-driven Linux terminal application for reviewing
-entries in `~/Downloads` and safely moving one selected entry to a directory
-beneath `$HOME`. Milestone 3 supports explicitly requested, same-filesystem
-moves without overwriting an existing path. In-place renaming and editing the
-resulting basename during a move are also implemented as part of Milestone 4.
+entries in `~/Downloads` and safely moving selected entries to a directory
+beneath `$HOME`. Milestones 1–4 provide reviewed same-filesystem moves without
+overwriting, individual renaming, selection and bulk actions, persistent
+ignore/restore, desktop Trash, and typed confirmation for permanent deletion.
 
 ## Requirements
 
@@ -30,15 +30,16 @@ Moving an entry uses three screens:
 
 1. **Inbox** lists the immediate files, directories, and usable symlinks in
    `$HOME/Downloads`. Select one entry and press `Enter`.
-2. **Destination Browser** starts at `$HOME`. Browse to an existing directory
+2. **Destination Browser** initially starts at `$HOME` and remembers the current
+   directory for subsequent moves in the session. Browse to an existing directory
    and press `d` to choose the current directory.
 3. **Move Preview** shows the selected entry's type, exact source path, chosen
    Destination, exact resulting path, and any validation failures. A valid
    Preview warns that `Enter` changes the filesystem; pressing it starts one Move
    Attempt directly.
 
-Returning to an earlier screen preserves its selection. Only one Proposed Move
-is represented at a time.
+Returning to an earlier screen preserves its selection. Multiple marked entries
+share one Destination and open Bulk Move Preview.
 
 ## Keybindings
 
@@ -50,8 +51,10 @@ is represented at a time.
 | `k` or Up Arrow | Select the previous Inbox Entry |
 | `gg` | Select the first Inbox Entry |
 | `G` | Select the final Inbox Entry |
-| `Enter` | Open the Destination Browser for the selected entry |
+| `Enter` | Open the Destination Browser for marked entries, or the highlighted entry |
 | `r` | Edit the selected entry's basename in place |
+| `t` | Review marked entries, or the highlighted entry, for desktop Trash |
+| `D` | Open typed confirmation to permanently delete marked entries, or the highlighted entry |
 | `Space` | Toggle the highlighted entry's mark |
 | `V` | Start or finish an inclusive visual range |
 | `a` | Toggle selection of all visible entries |
@@ -90,6 +93,19 @@ return without executing. Key repeat and release events are ignored. Repeated
 Enter presses in the Destination Browser only navigate; `d` is required to
 open Preview.
 
+### Editors, removal reviews, and bulk results
+
+| Screen | Controls |
+| --- | --- |
+| Ignored Entries | Inbox navigation and selection controls; `u` restores visibility, `I` returns to Inbox, `R` refreshes, `q` quits |
+| Filename editor | Type to append, Backspace removes the final character, Ctrl+u clears; Enter reviews, Esc cancels; ordinary letters including `q` are text |
+| Rename Preview | Enter executes a valid rename, Esc cancels to Inbox, `q` quits |
+| Trash Preview | Enter executes, Esc cancels, `q` quits; `j/k` or arrows scroll, `h/l` or arrows pan, Home resets |
+| Permanent Deletion Confirmation | Type exactly `delete`, then Enter; Backspace edits, Ctrl+u clears, Esc cancels; arrows scroll/pan, Home resets; `q` is text |
+| Bulk review | Enter executes (deletion requires typed `delete` first), Esc goes back; arrows scroll/pan, Page Up/Down page, Home resets; `j/k`, `h/l`, and `q` work except when entering deletion text |
+| Bulk progress | Esc stops before the next entry; other keys have no effect |
+| Bulk results | Enter or Esc returns to Inbox, `q` quits; `j/k` or arrows scroll, `h/l` or arrows pan, Page Up/Down page, Home resets |
+
 ## Select and refresh Inbox Entries
 
 The highlighted row is the cursor. A separate `[x]` suffix marks an entry, and
@@ -114,11 +130,173 @@ when possible, otherwise its index is clamped to the refreshed list.
 Refresh failure keeps the list and marks and reports that entries may be stale;
 `R` retries.
 
-Until bulk actions are available, Enter and `r` refuse multiple marked entries
-with an explanation. One marked entry takes precedence over the cursor; without
-marks they use the highlighted entry. A marked entry that has been replaced or
+Enter, `t`, and `D` support multiple marked entries; `r` refuses multiple marks
+with an explanation. One marked entry takes precedence over the cursor; without marks
+they use the highlighted entry. A marked entry that has been replaced or
 removed is refused until refresh. Starting an action exits visual mode.
 Successful individual actions clear the consumed mark; cancelling preserves it.
+
+## Move selected entries
+
+Mark two or more entries with Space, `V`, or `a`, then press `Enter` to browse
+for one Destination. Press `d` to open **Bulk Move Preview**. It lists every
+exact source and resulting path, preserving all original basenames; bulk moves
+have no name editor. Use `j`/`k` or arrows to scroll, Page Up/Down to page,
+`h`/`l` or left/right arrows to pan long paths, and Home to return to the start.
+Quoted, escaped paths preserve exact filename bytes.
+
+Press `Enter` to check the entire reviewed set again and execute only if every
+entry passes. Known collisions, missing or replaced sources, invalid Destinations,
+and cross-filesystem moves block the whole set without moving any entry.
+Per-entry problems appear in Preview. After fixing a problem, Enter rechecks
+and moves if valid; Esc returns to the browser. To accept a replaced source,
+return to Inbox, refresh with `R`, and select it again.
+
+Execution runs in the foreground in ascending source-path byte order, with a
+progress redraw between entries. Each entry is freshly validated, including its
+marked filesystem identity and real-directory Destination ancestry beneath HOME,
+immediately before its atomic no-replace move. There is no copying, merging,
+overwriting, automatic renaming, or rollback. The same best-effort userspace
+identity and path-check race limits as individual moves apply.
+
+During execution, `Esc` stops before the next entry. An entry already being
+processed finishes first. Other keys have no effect while processing. The first
+execution failure also stops the batch; completed moves remain completed.
+**Bulk Move Results** lists each entry as Completed, Failed (with its reason),
+or Unattempted, and shows counts for all three outcomes. The result list supports
+the same scrolling controls. Enter or Esc returns to Inbox.
+
+After processing, Inbox refreshes and its cursor stays near the former index.
+Completed entries lose their marks. Failed and unattempted entries remain marked
+when their identities still match, ready for another reviewed attempt. Completed
+results cannot be executed again. If refresh fails, known completed entries are
+removed from the retained list and the outcome includes a stale-list warning;
+`R` retries refresh from Inbox.
+
+## Trash or permanently delete selected entries
+
+Mark entries with Space, `V`, or `a`. Press `t` for **Bulk Trash Preview**, or
+uppercase `D` for **Bulk Permanent Deletion Confirmation**. Marked entries take
+precedence over the highlighted row. With no marks, the individual workflow
+uses the highlighted entry; with one mark, it uses that entry.
+
+Both batch reviews list every exact source path and its action, in ascending
+source-path byte order. Use arrows to scroll vertically or pan long paths,
+Page Up/Down to page, and Home to reset the view. Trash also supports `j`/`k`
+and `h`/`l`. Paths use quoted, escaped notation to retain exact filename bytes.
+
+From Trash preview, Enter rechecks the entire set and starts only if all entries
+pass. For permanent deletion, the review warns that the action bypasses Trash,
+removes all selected directory contents, and cannot be undone. Type exactly
+`delete`, then Enter, once for the whole reviewed set. Letters including `q`
+are confirmation text; Backspace edits and Ctrl+u clears. Empty text, different
+case, or extra characters cannot authorize deletion. A blocked attempt clears
+the confirmation and requires typing it again. Esc cancels either review and
+preserves marks. Repeated action keys and reported repeat/release events cannot
+bypass review or typed confirmation.
+
+Preflight checks all source identities and parent access. Trash also checks
+existing storage directories, storage ancestry, available parent access, and
+filesystem compatibility without creating storage. Known problems block the
+whole set and appear beside the affected entries. These checks do not guarantee
+execution: permissions, filesystem state, and directory contents can change;
+recursive child failures may only become apparent during deletion.
+
+Processing runs in the foreground, with progress drawn between entries. Each
+entry is freshly validated immediately before execution. Esc requests stopping
+before the next entry; it does not interrupt the current entry or recursive
+deletion. The first execution failure also stops processing. Completed actions
+remain completed, with no rollback. Trash never falls back to permanent deletion.
+
+Results show each entry as **Completed**, **Failed** with its error, or
+**Unattempted**, with counts for all three. Recursive-deletion failures warn
+that some contents may already be permanently deleted. Trash errors retain any
+warning about orphan restoration metadata. Enter or Esc returns to Inbox;
+results cannot be executed again. Restore successfully trashed entries through
+your file manager; permanent deletions have no undo.
+
+Inbox refreshes after processing. Completed marks are cleared, and failed or
+unattempted entries keep their marks only if the same filesystem identities
+remain. The cursor stays near its previous index. If refresh fails, completed
+rows are removed from the retained list, results remain truthful, and the notice
+warns that other rows may be stale. Return to Inbox and press `R` to refresh.
+Surviving marks are ready for a new review, which excludes completed entries.
+
+## Permanently delete one entry
+
+Highlight an entry and press uppercase `D` to open **Permanent Deletion
+Confirmation**. One marked entry takes precedence over the cursor; multiple
+marks open the bulk confirmation described above. The screen shows the exact source path, a count of one,
+and a warning that deletion bypasses Trash and removes all directory contents.
+
+Nothing is authorized initially. Type exactly lowercase `delete`, then press
+`Enter` to execute. Empty text, different capitalization, or extra characters
+cannot execute. `Backspace` edits and `Ctrl+u` clears the text. All ordinary
+letters, including `q`, are confirmation text; `Esc` cancels and preserves marks.
+Arrows scroll/pan long paths and errors, and Home resets the view. Reported key
+repeat/release events are ignored. Reopening confirmation starts with empty text.
+
+Files and non-empty directories are supported. Symlink Entries are unlinked,
+and links inside deleted directories are not followed. The Linux implementation
+uses [Rust's non-symlink-following recursive removal](https://doc.rust-lang.org/std/fs/fn.remove_dir_all.html).
+Source identity and type are checked again immediately before mutation. A
+missing or replaced entry is refused; cancel and refresh with `R` to review it
+again. Identity checks retain the same best-effort userspace race limitations
+as moves, and do not freeze a directory's contents during review.
+
+Permanent deletion cannot be undone through the application or recovered from
+Trash. Recursive deletion is not atomic: on failure, some contents may already
+have been deleted. The error makes this explicit, with no rollback guarantee.
+The reviewed path and mark remain; any retry requires typing `delete` again.
+An error warning remains visible when Enter is pressed without new consent.
+
+Success clears the consumed mark, refreshes Inbox, and selects near the old
+index. If refresh fails, the app still reports **Permanently deleted 1 entry**,
+removes the known-deleted row from its retained list, and warns that other rows
+may be stale. `R` retries the refresh.
+
+## Send an entry to Trash
+
+Highlight an entry and press `t` to open **Trash Preview**. One marked entry
+takes precedence over the cursor; multiple marks open Bulk Trash Preview. Preview shows the exact source in quoted, escaped notation and
+states that the action includes directory contents. Use `h`/`l` or left/right
+arrows to pan long paths and errors, `j`/`k` or up/down arrows to scroll, and
+Home to reset the view.
+
+Press a separate `Enter` to send the reviewed entry to Trash, or `Esc` to
+cancel and retain its mark. Repeated `t` presses cannot execute, and reported
+key repeat/release events are ignored. Files, non-empty directories, and
+symlinks are supported. A symlink is moved as a link, leaving its target alone.
+Fresh identity checks refuse a removed or replaced source; cancel and press
+`R` to review the current entry. Other failures retain Preview for retry.
+
+After success, Inbox refreshes, clears the consumed mark, and highlights the
+entry near the previous index. A refresh error still reports **Sent to Trash**,
+removes the known-trashed row, and warns that other rows may be stale. Press `R`
+to retry the refresh. Recovery is through your file manager's Trash view;
+Downloads Janitor has no restore-from-Trash or undo command.
+
+Storage follows the [freedesktop Trash specification](https://specifications.freedesktop.org/trash/latest/):
+`$XDG_DATA_HOME/Trash`, defaulting to `$HOME/.local/share/Trash` when the override
+is absent, empty, or relative. The `files` payload has matching `.trashinfo`
+metadata in `info`, recording the percent-encoded original absolute path and
+local deletion time. Names are reserved exclusively, and prior payloads are
+never overwritten. Metadata is written and flushed before moving the entry.
+
+This implementation supports Linux filesystems with atomic no-replace rename,
+with source and home Trash on the same filesystem. It does not use per-mount
+Trash, copy across filesystems, or fall back to permanent deletion. Trash,
+`files`, and `info` must be private directories owned by the current user,
+without symlinks; missing directories are created on execution. It refuses
+trashing Trash itself, its ancestors, or its contents.
+
+Failure can leave newly created storage directories. If reserved metadata cannot
+be cleaned up after a failed move, the error identifies the orphan metadata
+path. Identity and directory checks have the same userspace race limits as
+moves; this is not a transaction against concurrent filesystem changes. A crash
+between metadata creation and rename can leave orphan metadata, and the two
+records have no crash-atomic or power-loss durability guarantee. No recursive
+copy or deletion occurs during this action.
 
 ## Ignore and restore entries
 
@@ -131,7 +309,7 @@ Press uppercase `I` to switch to **Ignored Entries**. This view supports the sam
 navigation, Space, visual ranges, select-all, clear, and refresh controls.
 Press `u` to restore marked entries, or the highlighted entry. Restore changes
 saved state and returns entries to the normal Inbox; use `I` to return there
-for move or rename actions. Move, rename, and ignore bindings are disabled in
+for move or rename actions. Move, rename, Trash, permanent deletion, and ignore bindings are disabled in
 Ignored Entries. Switching views clears marks and starts at the first row.
 
 Ignored state is stored in
@@ -287,16 +465,16 @@ the known-moved source from its retained list, and reports both success and that
 the remaining entries may be stale.
 
 Downloads Janitor does not provide cross-filesystem copy-then-delete, overwrite,
-merge or collision resolution, delete or
-trash, undo or rollback, queues or bulk filesystem execution, rules,
-recursive processing, filesystem watching, timers, or background work.
+merge or collision resolution,
+undo or rollback, queues, configuration or rules, bulk rename, recursive Inbox
+scanning or organization, filesystem watching, timers, or background work.
+Explicit permanent deletion of a directory does recursively remove its contents.
 
 ## Roadmap
 
-Milestones 1 through 3 are implemented. Milestone 4 is in progress: Enter
-execution, individual in-place renaming, basename editing during moves, selection,
-explicit refresh, and persistent ignore/restore are available. Milestones 5 and 6
-remain proposed directions.
+Milestones 1 through 4 are implemented and verified. Milestone 4 delivers
+efficient manual Inbox processing; configuration and rules remain Milestone 5,
+and history/undo remain Milestone 6. Both later milestones are proposed directions.
 
 ### Milestone 1 — Read-Only Inbox Review
 
@@ -323,8 +501,10 @@ deliberate same-filesystem move at a time, using atomic no-replace behavior.
 
 The fourth milestone makes repeated review faster. Enter execution,
 individual in-place renaming, basename editing during moves, selection, and
-explicit refresh, and persistent ignore/restore are implemented. Remaining
-planned work includes bulk moves and reviewed trash or permanent deletion.
+explicit refresh, persistent ignore/restore, bulk moves, and individual desktop
+Trash and confirmed permanent deletion (individual and bulk) are implemented.
+The [mixed-entry acceptance scenario](docs/milestone-4-acceptance.md) records
+the verified workflow, expected filesystem results, and remaining limitations.
 
 ### Milestone 5 — Configuration and Rules
 
@@ -351,4 +531,12 @@ cargo fmt --check
 cargo check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+```
+
+For a disposable terminal walkthrough, fixture setup, and recorded results, see
+[Milestone 4 acceptance](docs/milestone-4-acceptance.md). The combined workflow
+regression test can also be run alone:
+
+```bash
+cargo test milestone_four_mixed_workflow_survives_actions_and_restart
 ```

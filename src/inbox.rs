@@ -13,7 +13,7 @@ pub enum EntryKind {
     File,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InboxEntry {
     identity: Option<SourceIdentity>,
     name: OsString,

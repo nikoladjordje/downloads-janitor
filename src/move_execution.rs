@@ -131,7 +131,7 @@ fn metadata_matches_entry_type(metadata: &fs::Metadata, entry_type: ProposedEntr
     }
 }
 
-fn rename_noreplace(
+pub(crate) fn rename_noreplace(
     source: &std::path::Path,
     destination: &std::path::Path,
 ) -> Result<(), MoveError> {

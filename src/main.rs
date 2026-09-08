@@ -1,12 +1,15 @@
 mod app;
+mod batch;
 mod destination;
 mod filename_editor;
 mod ignored_entries;
 mod inbox;
 mod inbox_marks;
 mod move_execution;
+mod permanent_delete;
 mod proposed_move;
 mod terminal;
+mod trash;
 mod ui;
 
 use std::error::Error;

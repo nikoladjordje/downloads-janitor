@@ -32,6 +32,10 @@ impl InboxMarks {
         self.marks.clear();
     }
 
+    pub fn remove(&mut self, entry: &InboxEntry) {
+        self.marks.remove(entry.path());
+    }
+
     pub fn toggle(&mut self, entry: &InboxEntry) {
         self.exit_visual();
         if self.contains(entry) {
