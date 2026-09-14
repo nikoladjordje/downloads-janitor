@@ -18,6 +18,67 @@ pub struct FavoriteDestination {
     path: PathBuf,
 }
 
+/// The Inbox Entry kind a Rule applies to. A Symlink Entry is always a symlink,
+/// even when its target is a file or directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuleKind {
+    Any,
+    File,
+    Directory,
+    Symlink,
+}
+
+impl RuleKind {
+    pub const ALL: [Self; 4] = [Self::Any, Self::File, Self::Directory, Self::Symlink];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any",
+            Self::File => "File",
+            Self::Directory => "Directory",
+            Self::Symlink => "Symlink",
+        }
+    }
+
+    fn encoded(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::File => "file",
+            Self::Directory => "directory",
+            Self::Symlink => "symlink",
+        }
+    }
+
+    fn decode(value: &str) -> Option<Self> {
+        Some(match value {
+            "any" => Self::Any,
+            "file" => Self::File,
+            "directory" => Self::Directory,
+            "symlink" => Self::Symlink,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Rule {
+    pattern: String,
+    kind: RuleKind,
+    favorite_name: String,
+}
+
+impl Rule {
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+    pub fn kind(&self) -> RuleKind {
+        self.kind
+    }
+    pub fn favorite_name(&self) -> &str {
+        &self.favorite_name
+    }
+}
+
 impl FavoriteDestination {
     pub fn name(&self) -> &str {
         &self.name
@@ -32,6 +93,7 @@ pub struct Favorites {
     home: PathBuf,
     path: PathBuf,
     entries: Vec<FavoriteDestination>,
+    rules: Vec<Rule>,
     warning: Option<String>,
 }
 
@@ -42,10 +104,14 @@ impl Favorites {
             home,
             path,
             entries: Vec::new(),
+            rules: Vec::new(),
             warning: None,
         };
         match read(&favorites.path).and_then(|contents| decode(&contents)) {
-            Ok(entries) => favorites.entries = entries,
+            Ok((entries, rules)) => {
+                favorites.entries = entries;
+                favorites.rules = rules;
+            }
             Err(error) => {
                 favorites.warning = Some(format!(
                     "Configuration is unreadable; Favorites cannot be changed. {error}. Repair {:?}",
@@ -58,6 +124,91 @@ impl Favorites {
 
     pub fn entries(&self) -> &[FavoriteDestination] {
         &self.entries
+    }
+
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
+    pub fn rule_has_available_favorite(&self, rule: &Rule) -> bool {
+        self.entries
+            .iter()
+            .any(|favorite| favorite.name == rule.favorite_name && self.available(favorite))
+    }
+
+    pub fn add_rule(
+        &mut self,
+        pattern: String,
+        kind: RuleKind,
+        favorite_name: String,
+    ) -> io::Result<()> {
+        self.ensure_writable()?;
+        self.validate_rule(&pattern, &favorite_name)?;
+        self.rules.push(Rule {
+            pattern,
+            kind,
+            favorite_name,
+        });
+        self.save_or_revert_rule()
+    }
+
+    pub fn replace_rule(
+        &mut self,
+        index: usize,
+        pattern: String,
+        kind: RuleKind,
+        favorite_name: String,
+    ) -> io::Result<()> {
+        self.ensure_writable()?;
+        self.validate_rule(&pattern, &favorite_name)?;
+        let rule = self
+            .rules
+            .get_mut(index)
+            .ok_or_else(|| io::Error::other("Rule no longer exists"))?;
+        let old = std::mem::replace(
+            rule,
+            Rule {
+                pattern,
+                kind,
+                favorite_name,
+            },
+        );
+        match self.save() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.rules[index] = old;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn remove_rule(&mut self, index: usize) -> io::Result<Rule> {
+        self.ensure_writable()?;
+        if index >= self.rules.len() {
+            return Err(io::Error::other("Rule no longer exists"));
+        }
+        let removed = self.rules.remove(index);
+        match self.save() {
+            Ok(()) => Ok(removed),
+            Err(error) => {
+                self.rules.insert(index, removed);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn move_rule(&mut self, index: usize, direction: isize) -> io::Result<usize> {
+        self.ensure_writable()?;
+        let destination = index
+            .checked_add_signed(direction)
+            .filter(|destination| *destination < self.rules.len())
+            .ok_or_else(|| io::Error::other("Rule is already at the boundary"))?;
+        self.rules.swap(index, destination);
+        if let Err(error) = self.save() {
+            self.rules.swap(index, destination);
+            return Err(error);
+        }
+        Ok(destination)
     }
 
     pub fn warning(&self) -> Option<&str> {
@@ -144,10 +295,36 @@ impl Favorites {
         }
     }
 
+    fn save_or_revert_rule(&mut self) -> io::Result<()> {
+        match self.save() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.rules.pop();
+                Err(error)
+            }
+        }
+    }
+
+    fn validate_rule(&self, pattern: &str, favorite_name: &str) -> io::Result<()> {
+        if pattern.is_empty() {
+            return Err(io::Error::other("Rule basename pattern cannot be empty"));
+        }
+        if !self
+            .entries
+            .iter()
+            .any(|favorite| favorite.name == favorite_name)
+        {
+            return Err(io::Error::other(
+                "Rule must reference an existing Favorite Destination",
+            ));
+        }
+        Ok(())
+    }
+
     fn save(&self) -> io::Result<()> {
         let parent = self.path.parent().expect("configuration path has a parent");
         fs::create_dir_all(parent)?;
-        let bytes = encode(&self.entries);
+        let bytes = encode(&self.entries, &self.rules);
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let temporary = parent.join(format!(
             ".configuration-{}-{}.tmp",
@@ -203,7 +380,7 @@ fn read(path: &Path) -> io::Result<Vec<u8>> {
     }
 }
 
-fn encode(entries: &[FavoriteDestination]) -> Vec<u8> {
+fn encode(entries: &[FavoriteDestination], rules: &[Rule]) -> Vec<u8> {
     let mut text = HEADER.to_owned();
     for favorite in entries {
         text.push_str(&format!(
@@ -212,10 +389,18 @@ fn encode(entries: &[FavoriteDestination]) -> Vec<u8> {
             hex(favorite.path.as_os_str().as_bytes())
         ));
     }
+    for rule in rules {
+        text.push_str(&format!(
+            "rule {} {} {}\n",
+            hex(rule.pattern.as_bytes()),
+            rule.kind.encoded(),
+            hex(rule.favorite_name.as_bytes())
+        ));
+    }
     text.into_bytes()
 }
 
-fn decode(bytes: &[u8]) -> io::Result<Vec<FavoriteDestination>> {
+fn decode(bytes: &[u8]) -> io::Result<(Vec<FavoriteDestination>, Vec<Rule>)> {
     let invalid = || io::Error::other("invalid configuration format");
     let text = std::str::from_utf8(bytes).map_err(|_| invalid())?;
     let body = text.strip_prefix(HEADER).ok_or_else(invalid)?;
@@ -223,25 +408,42 @@ fn decode(bytes: &[u8]) -> io::Result<Vec<FavoriteDestination>> {
         return Err(invalid());
     }
     let mut entries = Vec::new();
+    let mut rules = Vec::new();
     for line in body.lines() {
         let fields = line.split(' ').collect::<Vec<_>>();
-        if fields.len() != 3 || fields[0] != "favorite" {
-            return Err(invalid());
+        match fields.as_slice() {
+            ["favorite", name, path] => {
+                let name = String::from_utf8(unhex(name).map_err(|_| invalid())?)
+                    .map_err(|_| invalid())?;
+                validate_name(&name).map_err(|_| invalid())?;
+                let path = PathBuf::from(OsString::from_vec(unhex(path).map_err(|_| invalid())?));
+                if !path.is_absolute()
+                    || entries
+                        .iter()
+                        .any(|favorite: &FavoriteDestination| favorite.name == name)
+                {
+                    return Err(invalid());
+                }
+                entries.push(FavoriteDestination { name, path });
+            }
+            ["rule", pattern, kind, favorite_name] => {
+                let pattern = String::from_utf8(unhex(pattern).map_err(|_| invalid())?)
+                    .map_err(|_| invalid())?;
+                let favorite_name = String::from_utf8(unhex(favorite_name).map_err(|_| invalid())?)
+                    .map_err(|_| invalid())?;
+                if pattern.is_empty() || favorite_name.is_empty() {
+                    return Err(invalid());
+                }
+                rules.push(Rule {
+                    pattern,
+                    kind: RuleKind::decode(kind).ok_or_else(invalid)?,
+                    favorite_name,
+                });
+            }
+            _ => return Err(invalid()),
         }
-        let name =
-            String::from_utf8(unhex(fields[1]).map_err(|_| invalid())?).map_err(|_| invalid())?;
-        validate_name(&name).map_err(|_| invalid())?;
-        let path = PathBuf::from(OsString::from_vec(unhex(fields[2]).map_err(|_| invalid())?));
-        if !path.is_absolute()
-            || entries
-                .iter()
-                .any(|favorite: &FavoriteDestination| favorite.name == name)
-        {
-            return Err(invalid());
-        }
-        entries.push(FavoriteDestination { name, path });
     }
-    Ok(entries)
+    Ok((entries, rules))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -267,7 +469,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{FavoriteDestination, Favorites, decode, encode};
+    use super::{FavoriteDestination, Favorites, Rule, RuleKind, decode, encode};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -340,7 +542,39 @@ mod tests {
             name: "Raw name".into(),
             path: PathBuf::from(std::ffi::OsString::from_vec(b"/home/test/\xff".to_vec())),
         }];
-        assert_eq!(decode(&encode(&entries)).unwrap(), entries);
+        assert_eq!(decode(&encode(&entries, &[])).unwrap().0, entries);
         assert!(decode(b"bad").is_err());
+    }
+
+    #[test]
+    fn rules_persist_in_order_and_keep_missing_references() {
+        let home = TestDirectory::new();
+        let destination = home.0.join("Projects");
+        fs::create_dir(&destination).unwrap();
+        let mut favorites = Favorites::load(home.0.clone());
+        favorites.add("projects".into(), destination).unwrap();
+        favorites
+            .add_rule("*.rs".into(), RuleKind::File, "projects".into())
+            .unwrap();
+        favorites
+            .add_rule("*".into(), RuleKind::Any, "projects".into())
+            .unwrap();
+        favorites.move_rule(1, -1).unwrap();
+        assert_eq!(Favorites::load(home.0.clone()).rules()[0].pattern(), "*");
+        favorites.remove(0).unwrap();
+        let reloaded = Favorites::load(home.0.clone());
+        assert_eq!(reloaded.rules()[0].favorite_name(), "projects");
+        assert!(!reloaded.rule_has_available_favorite(&reloaded.rules()[0]));
+    }
+
+    #[test]
+    fn rule_format_round_trips() {
+        let rules = vec![Rule {
+            pattern: "*.txt".into(),
+            kind: RuleKind::File,
+            favorite_name: "Archive".into(),
+        }];
+        let (_, decoded) = decode(&encode(&[], &rules)).unwrap();
+        assert_eq!(decoded, rules);
     }
 }

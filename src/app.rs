@@ -10,7 +10,7 @@ use crate::{
     Result,
     batch::{Batch, BatchAction, EntryOutcome},
     destination::{DestinationBrowser, DestinationEntry},
-    favorites::{FavoriteDestination, Favorites},
+    favorites::{FavoriteDestination, Favorites, Rule, RuleKind},
     filename_editor::FilenameEditor,
     ignored_entries::IgnoredEntries,
     inbox::{self, InboxEntry},
@@ -39,6 +39,9 @@ pub enum Screen {
     Configuration,
     FavoriteNameEditor,
     FavoriteDestinationBrowser,
+    RulePatternEditor,
+    RuleKindPicker,
+    RuleFavoritePicker,
 }
 
 pub struct App {
@@ -56,6 +59,9 @@ pub struct App {
     viewing_ignored: bool,
     selection: Selection,
     configuration_selection: Selection,
+    rule_selection: Selection,
+    rule_kind_selection: Selection,
+    rule_favorite_selection: Selection,
     marks: InboxMarks,
     screen: Screen,
     destination_browser: DestinationBrowser,
@@ -64,6 +70,9 @@ pub struct App {
     rename_editor: Option<FilenameEditor>,
     favorite_name_editor: Option<FilenameEditor>,
     favorite_edit_index: Option<usize>,
+    rule_pattern_editor: Option<FilenameEditor>,
+    rule_edit_index: Option<usize>,
+    rule_kind: Option<RuleKind>,
     move_basename: Option<OsString>,
     notice: Option<String>,
     move_error: Option<String>,
@@ -105,6 +114,9 @@ impl App {
             other_entries,
             ignored,
             configuration_selection: Selection::new(favorites.entries().len()),
+            rule_selection: Selection::new(favorites.rules().len()),
+            rule_kind_selection: Selection::new(RuleKind::ALL.len()),
+            rule_favorite_selection: Selection::new(favorites.entries().len()),
             favorites,
             viewing_ignored: false,
             selection,
@@ -116,6 +128,9 @@ impl App {
             rename_editor: None,
             favorite_name_editor: None,
             favorite_edit_index: None,
+            rule_pattern_editor: None,
+            rule_edit_index: None,
+            rule_kind: None,
             move_basename: None,
             notice: None,
             move_error: None,
@@ -152,6 +167,27 @@ impl App {
 
     pub fn favorite_available(&self, favorite: &FavoriteDestination) -> bool {
         self.favorites.available(favorite)
+    }
+
+    pub fn rules(&self) -> &[Rule] {
+        self.favorites.rules()
+    }
+    pub fn rule_selected(&self) -> Option<usize> {
+        self.rule_selection.index()
+    }
+    pub fn rule_pattern(&self) -> Option<OsString> {
+        self.rule_pattern_editor.as_ref().map(FilenameEditor::name)
+    }
+    pub fn rule_kind_selected(&self) -> Option<RuleKind> {
+        self.rule_kind_selection
+            .index()
+            .map(|index| RuleKind::ALL[index])
+    }
+    pub fn rule_favorite_selected(&self) -> Option<usize> {
+        self.rule_favorite_selection.index()
+    }
+    pub fn rule_has_available_favorite(&self, rule: &Rule) -> bool {
+        self.favorites.rule_has_available_favorite(rule)
     }
 
     pub fn entries(&self) -> &[InboxEntry] {
@@ -264,6 +300,10 @@ impl App {
                 self.handle_favorite_name_editor(key);
                 return;
             }
+            if self.screen == Screen::RulePatternEditor {
+                self.handle_rule_pattern_editor(key);
+                return;
+            }
             if key.code != KeyCode::Char('g') {
                 self.pending_g = false;
             }
@@ -283,6 +323,15 @@ impl App {
                 KeyCode::Char('x') if self.screen == Screen::Configuration => {
                     self.remove_favorite();
                 }
+                KeyCode::Char('A') if self.screen == Screen::Configuration => {
+                    self.start_rule_edit(None)
+                }
+                KeyCode::Char('E') if self.screen == Screen::Configuration => {
+                    self.start_rule_edit(self.rule_selected())
+                }
+                KeyCode::Char('X') if self.screen == Screen::Configuration => self.remove_rule(),
+                KeyCode::Char(']') if self.screen == Screen::Configuration => self.move_rule(1),
+                KeyCode::Char('[') if self.screen == Screen::Configuration => self.move_rule(-1),
                 KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::Configuration => {
                     self.configuration_selection
                         .move_down(self.favorites.entries().len());
@@ -293,6 +342,36 @@ impl App {
                 KeyCode::Char('G') if self.screen == Screen::Configuration => {
                     self.configuration_selection
                         .move_to_last(self.favorites.entries().len());
+                }
+                KeyCode::Char('J') if self.screen == Screen::Configuration => {
+                    self.rule_selection.move_down(self.rules().len())
+                }
+                KeyCode::Char('K') if self.screen == Screen::Configuration => {
+                    self.rule_selection.move_up()
+                }
+                KeyCode::Enter if self.screen == Screen::RuleKindPicker => {
+                    self.rule_kind = self.rule_kind_selected();
+                    self.screen = Screen::RuleFavoritePicker;
+                }
+                KeyCode::Esc if self.screen == Screen::RuleKindPicker => {
+                    self.screen = Screen::RulePatternEditor
+                }
+                KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::RuleKindPicker => {
+                    self.rule_kind_selection.move_down(RuleKind::ALL.len())
+                }
+                KeyCode::Char('k') | KeyCode::Up if self.screen == Screen::RuleKindPicker => {
+                    self.rule_kind_selection.move_up()
+                }
+                KeyCode::Enter if self.screen == Screen::RuleFavoritePicker => self.save_rule(),
+                KeyCode::Esc if self.screen == Screen::RuleFavoritePicker => {
+                    self.screen = Screen::RuleKindPicker
+                }
+                KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::RuleFavoritePicker => {
+                    self.rule_favorite_selection
+                        .move_down(self.favorites.entries().len())
+                }
+                KeyCode::Char('k') | KeyCode::Up if self.screen == Screen::RuleFavoritePicker => {
+                    self.rule_favorite_selection.move_up()
                 }
                 KeyCode::Esc if self.screen == Screen::Configuration => self.screen = Screen::Inbox,
                 KeyCode::Char('D') if self.screen == Screen::Inbox && !self.viewing_ignored => {
@@ -538,7 +617,10 @@ impl App {
                             | Screen::BulkPreview
                             | Screen::BulkProgress
                             | Screen::BulkResult
-                            | Screen::FavoriteNameEditor => {}
+                            | Screen::FavoriteNameEditor
+                            | Screen::RulePatternEditor
+                            | Screen::RuleKindPicker
+                            | Screen::RuleFavoritePicker => {}
                         }
                         self.pending_g = false;
                     } else {
@@ -682,6 +764,152 @@ impl App {
             Err(error) => {
                 self.notice = Some(format!("Cannot remove Favorite Destination: {error}"))
             }
+        }
+    }
+
+    fn start_rule_edit(&mut self, index: Option<usize>) {
+        let rule = index.and_then(|index| self.rules().get(index));
+        let pattern = rule
+            .map(|rule| OsString::from(rule.pattern()))
+            .unwrap_or_default();
+        let kind = rule.map(Rule::kind);
+        let favorite_name = rule.map(|rule| rule.favorite_name().to_owned());
+        self.rule_pattern_editor = Some(FilenameEditor::new(&pattern));
+        self.rule_edit_index = index;
+        self.rule_kind = kind;
+        self.rule_kind_selection = Selection::new(RuleKind::ALL.len());
+        self.rule_favorite_selection = Selection::new(self.favorites.entries().len());
+        if let Some(kind) = self.rule_kind {
+            self.rule_kind_selection.index = RuleKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind);
+        }
+        if let Some(name) = favorite_name.as_deref() {
+            self.rule_favorite_selection.index = self
+                .favorites
+                .entries()
+                .iter()
+                .position(|favorite| favorite.name() == name);
+        }
+        self.move_error = None;
+        self.screen = Screen::RulePatternEditor;
+    }
+
+    fn handle_rule_pattern_editor(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.rule_pattern_editor = None;
+                self.rule_edit_index = None;
+                self.move_error = None;
+                self.screen = Screen::Configuration;
+            }
+            KeyCode::Enter => {
+                let Some(pattern) = self
+                    .rule_pattern()
+                    .and_then(|pattern| pattern.into_string().ok())
+                else {
+                    self.move_error = Some("Rule patterns must be valid Unicode text".into());
+                    return;
+                };
+                if pattern.is_empty() {
+                    self.move_error = Some("Rule basename pattern cannot be empty".into());
+                    return;
+                }
+                self.move_error = None;
+                self.screen = Screen::RuleKindPicker;
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => self
+                .rule_pattern_editor
+                .as_mut()
+                .expect("rule editor exists")
+                .clear(),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.rule_pattern_editor
+                    .as_mut()
+                    .expect("rule editor exists")
+                    .append(character);
+                self.move_error = None;
+            }
+            KeyCode::Backspace => {
+                self.rule_pattern_editor
+                    .as_mut()
+                    .expect("rule editor exists")
+                    .backspace();
+                self.move_error = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn save_rule(&mut self) {
+        let Some(pattern) = self
+            .rule_pattern()
+            .and_then(|pattern| pattern.into_string().ok())
+        else {
+            return;
+        };
+        let Some(kind) = self.rule_kind else {
+            return;
+        };
+        let Some(favorite) = self
+            .rule_favorite_selection
+            .index()
+            .and_then(|index| self.favorites.entries().get(index))
+        else {
+            self.move_error = Some("Choose a Favorite Destination for this Rule".into());
+            return;
+        };
+        let result = match self.rule_edit_index {
+            Some(index) => {
+                self.favorites
+                    .replace_rule(index, pattern, kind, favorite.name().into())
+            }
+            None => self
+                .favorites
+                .add_rule(pattern, kind, favorite.name().into()),
+        };
+        match result {
+            Ok(()) => {
+                let count = self.rules().len();
+                self.rule_selection.index = self.rule_edit_index.or(count.checked_sub(1));
+                self.rule_pattern_editor = None;
+                self.rule_edit_index = None;
+                self.rule_kind = None;
+                self.notice = Some("Rule saved".into());
+                self.screen = Screen::Configuration;
+            }
+            Err(error) => {
+                self.move_error = Some(error.to_string());
+                self.screen = Screen::RulePatternEditor;
+            }
+        }
+    }
+
+    fn remove_rule(&mut self) {
+        let Some(index) = self.rule_selected() else {
+            return;
+        };
+        match self.favorites.remove_rule(index) {
+            Ok(_) => {
+                self.rule_selection
+                    .repair_after_removal(index, self.rules().len());
+                self.notice = Some("Removed Rule".into());
+            }
+            Err(error) => self.notice = Some(format!("Cannot remove Rule: {error}")),
+        }
+    }
+
+    fn move_rule(&mut self, direction: isize) {
+        let Some(index) = self.rule_selected() else {
+            return;
+        };
+        match self.favorites.move_rule(index, direction) {
+            Ok(destination) => self.rule_selection.index = Some(destination),
+            Err(error) => self.notice = Some(format!("Cannot reorder Rule: {error}")),
         }
     }
 
@@ -1325,7 +1553,7 @@ mod tests {
 
     use crate::proposed_move::{ProposedEntryType, ProposedMove};
 
-    use super::{App, Screen, Selection};
+    use super::{App, RuleKind, Screen, Selection};
 
     fn app_with_entries(entry_count: usize) -> App {
         App::new(
@@ -1529,6 +1757,48 @@ mod tests {
         assert!(app.favorites().is_empty());
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.screen(), Screen::Inbox);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn configuration_manages_ordered_rules_that_reference_favorites() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-rules-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(home.join("Archive")).unwrap();
+        let mut app = App::new(Vec::new(), home.clone());
+        press(&mut app, KeyCode::Char('C'));
+        press(&mut app, KeyCode::Char('a'));
+        for character in "archive".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.favorites().len(), 1);
+
+        press(&mut app, KeyCode::Char('A'));
+        for character in "*.rs".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.rules().len(), 1);
+        assert_eq!(app.rules()[0].pattern(), "*.rs");
+        assert_eq!(app.rules()[0].kind(), RuleKind::File);
+        assert_eq!(app.rules()[0].favorite_name(), "archive");
+        assert_eq!(
+            App::new(Vec::new(), home.clone()).rules()[0].pattern(),
+            "*.rs"
+        );
+
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.rules().is_empty());
         fs::remove_dir_all(home).unwrap();
     }
 

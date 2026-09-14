@@ -24,6 +24,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::RenameEditor | Screen::MoveNameEditor => render_rename_editor(frame, app),
         Screen::Configuration => render_configuration(frame, app),
         Screen::FavoriteNameEditor => render_favorite_name_editor(frame, app),
+        Screen::RulePatternEditor => render_rule_pattern_editor(frame, app),
+        Screen::RuleKindPicker => render_rule_kind_picker(frame, app),
+        Screen::RuleFavoritePicker => render_rule_favorite_picker(frame, app),
     }
 }
 
@@ -425,7 +428,7 @@ fn render_configuration(frame: &mut Frame<'_>, app: &App) {
         .block(Block::bordered().title("Configuration")),
         areas[0],
     );
-    let items = app
+    let favorite_items = app
         .favorites()
         .iter()
         .map(|favorite| {
@@ -443,20 +446,129 @@ fn render_configuration(frame: &mut Frame<'_>, app: &App) {
             })
         })
         .collect::<Vec<_>>();
-    let list = List::new(items)
+    let favorite_list = List::new(favorite_items)
         .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
         .highlight_symbol("> ")
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     state.select(app.favorite_selected());
-    frame.render_stateful_widget(list, areas[1], &mut state);
+    let content =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(areas[1]);
+    frame.render_stateful_widget(
+        favorite_list.block(
+            Block::default()
+                .title("Favorite Destinations")
+                .borders(Borders::ALL),
+        ),
+        content[0],
+        &mut state,
+    );
+    let rule_items = app
+        .rules()
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            let available = app.rule_has_available_favorite(rule);
+            let suffix = if available {
+                ""
+            } else {
+                " (missing or unavailable Favorite)"
+            };
+            ListItem::new(format!(
+                "{}. {:?} [{}] → {:?}{suffix}",
+                index + 1,
+                rule.pattern(),
+                rule.kind().label(),
+                rule.favorite_name()
+            ))
+            .style(if available {
+                Style::default()
+            } else {
+                Style::default().fg(Color::Yellow)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut rule_state = ListState::default();
+    rule_state.select(app.rule_selected());
+    frame.render_stateful_widget(
+        List::new(rule_items)
+            .block(
+                Block::default()
+                    .title("Rules (first match wins)")
+                    .borders(Borders::ALL),
+            )
+            .highlight_symbol("> ")
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        content[1],
+        &mut rule_state,
+    );
     frame.render_widget(
         Paragraph::new(
-            "j/k ↑/↓ Navigate  gg Top  G Bottom  a Add  Enter/e Edit  x Delete  Esc Inbox  q Quit",
+            "Favorites: a/e/x, j/k. Rules: A/E/X, J/K select, [/] reorder. Esc Inbox  q Quit",
         )
         .alignment(Alignment::Right)
         .block(Block::bordered()),
         areas[2],
+    );
+}
+
+fn render_rule_pattern_editor(frame: &mut Frame<'_>, app: &App) {
+    let pattern = app.rule_pattern().expect("rule editor has a pattern");
+    let mut lines = vec![
+        Line::from(format!("Basename pattern: {pattern:?}")),
+        Line::from("Pattern must be non-empty; it is evaluated against a basename."),
+        Line::from("Backspace removes the last character; Ctrl+u clears."),
+        Line::default(),
+        Line::from("Enter Choose Kind    Esc Cancel"),
+    ];
+    if let Some(error) = app.move_error() {
+        lines.push(Line::from(Span::styled(
+            error,
+            Style::default().fg(Color::Red),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title("Rule Basename Pattern")),
+        frame.area(),
+    );
+}
+
+fn render_rule_kind_picker(frame: &mut Frame<'_>, app: &App) {
+    let items = crate::favorites::RuleKind::ALL
+        .iter()
+        .map(|kind| ListItem::new(kind.label()))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    state.select(app.rule_kind_selected().and_then(|kind| {
+        crate::favorites::RuleKind::ALL
+            .iter()
+            .position(|candidate| *candidate == kind)
+    }));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(Block::bordered().title("Rule Entry Kind"))
+            .highlight_symbol("> ")
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        frame.area(),
+        &mut state,
+    );
+}
+
+fn render_rule_favorite_picker(frame: &mut Frame<'_>, app: &App) {
+    let items = app
+        .favorites()
+        .iter()
+        .map(|favorite| ListItem::new(format!("{}: {:?}", favorite.name(), favorite.path())))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    state.select(app.rule_favorite_selected());
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(Block::bordered().title("Choose Rule Favorite Destination"))
+            .highlight_symbol("> ")
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        frame.area(),
+        &mut state,
     );
 }
 

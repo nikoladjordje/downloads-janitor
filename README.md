@@ -62,7 +62,7 @@ share one Destination and open Bulk Move Preview.
 | `R` | Refresh Inbox, reload ignored state, and reconcile marks |
 | `i` | Persistently ignore marked entries, or the highlighted entry |
 | `I` | Switch between Inbox and Ignored Entries |
-| `C` | Open Configuration and manage Favorite Destinations |
+| `C` | Open Configuration and manage Favorite Destinations and Rules |
 | `q` | Quit and restore the terminal |
 
 ### Destination Browser
@@ -266,11 +266,20 @@ Destination Browser; press `d` there to save the currently shown directory. A pa
 that later disappears or becomes invalid remains visible as **unavailable** so
 it can be repaired or removed.
 
-Favorites are saved in
+Rules are ordered, deterministic instructions made of a non-empty basename
+pattern, an Entry Kind (`Any`, `File`, `Directory`, or `Symlink`), and a
+reference to a Favorite by name. In Configuration, use uppercase `A`, `E`, and
+`X` to add, edit, and remove Rules; uppercase `J`/`K` selects a Rule and `[`/`]
+reorders it. The list shows its first-match-wins order. A Rule never duplicates
+a Favorite path. If a Favorite is removed, renamed, or becomes unavailable,
+the Rule is retained and visibly reported as missing or unavailable for repair.
+Rules do not yet change manual move, rename, ignore, Trash, or deletion
+workflows.
+
+Favorites and Rules are saved in
 `$HOME/.config/downloads-janitor/configuration-v1` and reload on restart. An
 unreadable configuration is left untouched and displayed as a warning; repair
-it before changing Favorites. Favorites are only configuration in this slice:
-they do not yet alter manual move, rename, ignore, Trash, or deletion workflows.
+it before changing Configuration.
 
 ## Send an entry to Trash
 
