@@ -83,6 +83,27 @@ impl DestinationBrowser {
         }
     }
 
+    /// Starts browsing at a known Destination while retaining the HOME boundary.
+    /// Returns false when the path can no longer be safely browsed.
+    pub fn open_at(&mut self, path: &Path) -> bool {
+        if !path.starts_with(&self.home) {
+            return false;
+        }
+        match scan_directory(&self.home, path) {
+            Ok(entries) => {
+                self.current = path.to_path_buf();
+                self.entries = entries;
+                self.selected = (!self.entries.is_empty()).then_some(0);
+                self.error = None;
+                true
+            }
+            Err(error) => {
+                self.error = Some(error.to_string());
+                false
+            }
+        }
+    }
+
     pub fn move_down(&mut self) {
         if let Some(selected) = self.selected {
             self.selected = Some((selected + 1).min(self.entries.len().saturating_sub(1)));

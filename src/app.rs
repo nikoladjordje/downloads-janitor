@@ -63,6 +63,7 @@ pub struct App {
     rule_kind_selection: Selection,
     rule_favorite_selection: Selection,
     rule_matches: Vec<crate::rule_match::RuleMatch>,
+    active_suggestion: Option<crate::rule_match::SuggestedDestination>,
     marks: InboxMarks,
     screen: Screen,
     destination_browser: DestinationBrowser,
@@ -119,6 +120,7 @@ impl App {
             rule_kind_selection: Selection::new(RuleKind::ALL.len()),
             rule_favorite_selection: Selection::new(favorites.entries().len()),
             rule_matches: Vec::new(),
+            active_suggestion: None,
             favorites,
             viewing_ignored: false,
             selection,
@@ -197,6 +199,10 @@ impl App {
     #[allow(dead_code)] // Read by the next presentation slice; retained now as explicit state.
     pub fn rule_match(&self, index: usize) -> Option<&crate::rule_match::RuleMatch> {
         self.rule_matches.get(index)
+    }
+
+    pub fn active_suggestion(&self) -> Option<&crate::rule_match::SuggestedDestination> {
+        self.active_suggestion.as_ref()
     }
 
     pub fn entries(&self) -> &[InboxEntry] {
@@ -502,8 +508,23 @@ impl App {
                         None
                     };
                     self.move_error = None;
-                    self.destination_browser.refresh();
-                    self.screen = Screen::DestinationBrowser;
+                    self.active_suggestion = self
+                        .rule_match(self.selected().expect("action has an entry"))
+                        .and_then(|matched| match matched {
+                            crate::rule_match::RuleMatch::Suggested(suggestion) => {
+                                Some(suggestion.clone())
+                            }
+                            crate::rule_match::RuleMatch::Unmatched => None,
+                        });
+                    if let Some(suggestion) = self.active_suggestion.clone()
+                        && self.destination_browser.open_at(suggestion.path())
+                    {
+                        self.proposed_move = self.build_move_proposal();
+                        self.screen = Screen::MovePreview;
+                    } else {
+                        self.destination_browser.refresh();
+                        self.screen = Screen::DestinationBrowser;
+                    }
                 }
                 KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right
                     if matches!(
@@ -533,6 +554,7 @@ impl App {
                     }
                 }
                 KeyCode::Esc if self.screen == Screen::DestinationBrowser => {
+                    self.active_suggestion = None;
                     self.screen = Screen::Inbox;
                 }
                 KeyCode::Esc if self.screen == Screen::FavoriteDestinationBrowser => {
@@ -1321,6 +1343,7 @@ impl App {
         self.rename_editor = None;
         self.proposed_move = None;
         self.source_identity = None;
+        self.active_suggestion = None;
         self.move_error = None;
     }
 
@@ -1503,6 +1526,7 @@ impl App {
         self.screen = Screen::Inbox;
         self.proposed_move = None;
         self.source_identity = None;
+        self.active_suggestion = None;
         self.move_error = None;
         self.notice = Some(notice);
         self.marks.clear();
@@ -1881,6 +1905,47 @@ mod tests {
         };
         assert_eq!(symlink.rule_index(), 3);
         assert_eq!(app.rule_match(3), Some(&RuleMatch::Unmatched));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn suggested_destination_opens_a_reviewable_preview_and_can_be_overridden() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-suggested-move-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        let suggested = home.join("Projects");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::create_dir(&suggested).unwrap();
+        fs::write(downloads.join("report.txt"), b"keep").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+        app.favorites
+            .add("projects".into(), suggested.clone())
+            .unwrap();
+        app.favorites
+            .add_rule("*.txt".into(), RuleKind::File, "projects".into())
+            .unwrap();
+        app.evaluate_rule_matches();
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::MovePreview);
+        assert_eq!(app.proposed_move().unwrap().destination(), suggested);
+        assert_eq!(app.active_suggestion().unwrap().favorite_name(), "projects");
+        assert!(
+            downloads.join("report.txt").exists(),
+            "opening a suggestion is read-only"
+        );
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen(), Screen::DestinationBrowser);
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.screen(), Screen::MovePreview);
+        assert_eq!(app.proposed_move().unwrap().destination(), home);
+        assert_eq!(app.active_suggestion().unwrap().path(), suggested);
+        assert!(downloads.join("report.txt").exists());
         fs::remove_dir_all(home).unwrap();
     }
 

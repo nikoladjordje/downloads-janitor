@@ -313,11 +313,22 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
     let items = app
         .entries()
         .iter()
-        .map(|entry| {
+        .enumerate()
+        .map(|(index, entry)| {
+            let suggestion = match app.rule_match(index) {
+                Some(crate::rule_match::RuleMatch::Suggested(suggestion)) => format!(
+                    "  Rule #{} → {} ({:?})",
+                    suggestion.rule_index() + 1,
+                    suggestion.favorite_name(),
+                    suggestion.path()
+                ),
+                Some(crate::rule_match::RuleMatch::Unmatched) | None => "  Unmatched".to_owned(),
+            };
             ListItem::new(format!(
-                "{}{}",
+                "{}{}\n{}",
                 entry.display_name(),
-                if app.marked(entry) { " [x]" } else { "" }
+                if app.marked(entry) { " [x]" } else { "" },
+                suggestion,
             ))
         })
         .collect::<Vec<_>>();
@@ -653,6 +664,21 @@ fn render_preview(frame: &mut Frame<'_>, app: &App) {
         ]),
         Line::default(),
     ];
+    if !renaming {
+        if let Some(suggestion) = app.active_suggestion() {
+            lines.push(Line::from(format!(
+                "Winning Rule #{} suggests {} at {:?}",
+                suggestion.rule_index() + 1,
+                suggestion.favorite_name(),
+                suggestion.path()
+            )));
+        } else {
+            lines.push(Line::from(
+                "No Rule suggestion; Destination was chosen manually.",
+            ));
+        }
+        lines.push(Line::default());
+    }
     if proposal.is_valid() {
         lines.push(Line::from(Span::styled(
             "Warning: pressing Enter will change the filesystem",
