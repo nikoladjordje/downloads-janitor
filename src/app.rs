@@ -62,6 +62,7 @@ pub struct App {
     rule_selection: Selection,
     rule_kind_selection: Selection,
     rule_favorite_selection: Selection,
+    rule_matches: Vec<crate::rule_match::RuleMatch>,
     marks: InboxMarks,
     screen: Screen,
     destination_browser: DestinationBrowser,
@@ -99,7 +100,7 @@ impl App {
         let selection = Selection::new(entries.len());
         let favorites = Favorites::load(home.clone());
         let inbox_path = home.join("Downloads");
-        Self {
+        let mut app = Self {
             delete_review: None,
             delete_confirmation: String::new(),
             trash_review: None,
@@ -117,6 +118,7 @@ impl App {
             rule_selection: Selection::new(favorites.rules().len()),
             rule_kind_selection: Selection::new(RuleKind::ALL.len()),
             rule_favorite_selection: Selection::new(favorites.entries().len()),
+            rule_matches: Vec::new(),
             favorites,
             viewing_ignored: false,
             selection,
@@ -138,7 +140,9 @@ impl App {
             inbox_scanner,
             pending_g: false,
             should_quit: false,
-        }
+        };
+        app.evaluate_rule_matches();
+        app
     }
 
     pub fn viewing_ignored(&self) -> bool {
@@ -188,6 +192,11 @@ impl App {
     }
     pub fn rule_has_available_favorite(&self, rule: &Rule) -> bool {
         self.favorites.rule_has_available_favorite(rule)
+    }
+
+    #[allow(dead_code)] // Read by the next presentation slice; retained now as explicit state.
+    pub fn rule_match(&self, index: usize) -> Option<&crate::rule_match::RuleMatch> {
+        self.rule_matches.get(index)
     }
 
     pub fn entries(&self) -> &[InboxEntry] {
@@ -739,6 +748,7 @@ impl App {
                 self.favorite_edit_index = None;
                 self.move_error = None;
                 self.notice = Some("Favorite Destination saved".into());
+                self.evaluate_rule_matches();
                 self.screen = Screen::Configuration;
             }
             Err(error) => {
@@ -760,6 +770,7 @@ impl App {
                     "Removed Favorite Destination {:?}",
                     favorite.name()
                 ));
+                self.evaluate_rule_matches();
             }
             Err(error) => {
                 self.notice = Some(format!("Cannot remove Favorite Destination: {error}"))
@@ -880,6 +891,7 @@ impl App {
                 self.rule_edit_index = None;
                 self.rule_kind = None;
                 self.notice = Some("Rule saved".into());
+                self.evaluate_rule_matches();
                 self.screen = Screen::Configuration;
             }
             Err(error) => {
@@ -898,6 +910,7 @@ impl App {
                 self.rule_selection
                     .repair_after_removal(index, self.rules().len());
                 self.notice = Some("Removed Rule".into());
+                self.evaluate_rule_matches();
             }
             Err(error) => self.notice = Some(format!("Cannot remove Rule: {error}")),
         }
@@ -908,7 +921,10 @@ impl App {
             return;
         };
         match self.favorites.move_rule(index, direction) {
-            Ok(destination) => self.rule_selection.index = Some(destination),
+            Ok(destination) => {
+                self.rule_selection.index = Some(destination);
+                self.evaluate_rule_matches();
+            }
             Err(error) => self.notice = Some(format!("Cannot reorder Rule: {error}")),
         }
     }
@@ -1062,12 +1078,14 @@ impl App {
         std::mem::swap(&mut self.entries, &mut self.other_entries);
         self.selection = Selection::new(self.entries.len());
         self.marks.clear();
+        self.evaluate_rule_matches();
     }
 
     fn replace_inbox_entries(&mut self, entries: Vec<InboxEntry>) {
         (self.entries, self.other_entries) = entries
             .into_iter()
             .partition(|entry| self.ignored.contains(entry) == self.viewing_ignored);
+        self.evaluate_rule_matches();
     }
 
     fn change_ignored(&mut self, ignore: bool) {
@@ -1110,6 +1128,7 @@ impl App {
         self.entries = retained;
         inbox::sort_entries(&mut self.other_entries);
         self.marks.clear();
+        self.evaluate_rule_matches();
         self.selection
             .repair_after_removal(former_index, self.entries.len());
         self.notice = Some(format!(
@@ -1119,6 +1138,14 @@ impl App {
                 .map(|warning| format!("; {warning}"))
                 .unwrap_or_default()
         ));
+    }
+
+    fn evaluate_rule_matches(&mut self) {
+        self.rule_matches = self
+            .entries
+            .iter()
+            .map(|entry| self.favorites.suggested_match(entry))
+            .collect();
     }
 
     fn prepare_individual_action(&mut self) -> bool {
@@ -1554,6 +1581,7 @@ mod tests {
     use crate::proposed_move::{ProposedEntryType, ProposedMove};
 
     use super::{App, RuleKind, Screen, Selection};
+    use crate::rule_match::RuleMatch;
 
     fn app_with_entries(entry_count: usize) -> App {
         App::new(
@@ -1799,6 +1827,60 @@ mod tests {
 
         press(&mut app, KeyCode::Char('X'));
         assert!(app.rules().is_empty());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn rule_matches_use_first_ordered_basename_kind_match_and_leave_raw_names_manual() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-rule-matches-{}",
+            std::process::id()
+        ));
+        let projects = home.join("Projects");
+        let archive = home.join("Archive");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&projects).unwrap();
+        fs::create_dir(&archive).unwrap();
+        let raw_path = home.join(std::ffi::OsString::from_vec(b"raw-\xff".to_vec()));
+        fs::write(&raw_path, b"raw").unwrap();
+        let entries = vec![
+            InboxEntry::test_file("main.rs"),
+            InboxEntry::test_directory("notes"),
+            InboxEntry::test_symlink("source-link", crate::inbox::EntryKind::File),
+            InboxEntry::test_entry(raw_path, crate::inbox::EntryKind::File, false),
+        ];
+        let mut app = App::new(entries, home.clone());
+        app.favorites
+            .add("projects".into(), projects.clone())
+            .unwrap();
+        app.favorites.add("archive".into(), archive).unwrap();
+        app.favorites
+            .add_rule("*.rs".into(), RuleKind::File, "projects".into())
+            .unwrap();
+        app.favorites
+            .add_rule("main.*".into(), RuleKind::Any, "archive".into())
+            .unwrap();
+        app.favorites
+            .add_rule("notes".into(), RuleKind::Directory, "archive".into())
+            .unwrap();
+        app.favorites
+            .add_rule("source-*".into(), RuleKind::Symlink, "projects".into())
+            .unwrap();
+        app.evaluate_rule_matches();
+
+        let RuleMatch::Suggested(suggestion) = app.rule_match(0).unwrap() else {
+            panic!("expected suggestion")
+        };
+        assert_eq!(suggestion.rule_index(), 0, "first matching Rule wins");
+        assert_eq!(suggestion.path(), projects);
+        assert!(matches!(app.rule_match(1), Some(RuleMatch::Suggested(_))));
+        let RuleMatch::Suggested(symlink) = app.rule_match(2).unwrap() else {
+            panic!("expected symlink suggestion")
+        };
+        assert_eq!(symlink.rule_index(), 3);
+        assert_eq!(app.rule_match(3), Some(&RuleMatch::Unmatched));
         fs::remove_dir_all(home).unwrap();
     }
 

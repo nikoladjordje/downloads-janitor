@@ -9,6 +9,7 @@ mod inbox_marks;
 mod move_execution;
 mod permanent_delete;
 mod proposed_move;
+mod rule_match;
 mod terminal;
 mod trash;
 mod ui;

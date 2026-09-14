@@ -136,6 +136,18 @@ impl Favorites {
             .any(|favorite| favorite.name == rule.favorite_name && self.available(favorite))
     }
 
+    pub fn suggested_match(
+        &self,
+        entry: &crate::inbox::InboxEntry,
+    ) -> crate::rule_match::RuleMatch {
+        crate::rule_match::evaluate(entry, &self.rules, |name| {
+            self.entries
+                .iter()
+                .find(|favorite| favorite.name == name && self.available(favorite))
+                .map(|favorite| favorite.path.clone())
+        })
+    }
+
     pub fn add_rule(
         &mut self,
         pattern: String,
