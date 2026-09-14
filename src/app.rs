@@ -10,6 +10,7 @@ use crate::{
     Result,
     batch::{Batch, BatchAction, EntryOutcome},
     destination::{DestinationBrowser, DestinationEntry},
+    favorites::{FavoriteDestination, Favorites},
     filename_editor::FilenameEditor,
     ignored_entries::IgnoredEntries,
     inbox::{self, InboxEntry},
@@ -35,6 +36,9 @@ pub enum Screen {
     BulkPreview,
     BulkProgress,
     BulkResult,
+    Configuration,
+    FavoriteNameEditor,
+    FavoriteDestinationBrowser,
 }
 
 pub struct App {
@@ -48,14 +52,18 @@ pub struct App {
     entries: Vec<InboxEntry>,
     other_entries: Vec<InboxEntry>,
     ignored: IgnoredEntries,
+    favorites: Favorites,
     viewing_ignored: bool,
     selection: Selection,
+    configuration_selection: Selection,
     marks: InboxMarks,
     screen: Screen,
     destination_browser: DestinationBrowser,
     proposed_move: Option<ProposedMove>,
     source_identity: Option<SourceIdentity>,
     rename_editor: Option<FilenameEditor>,
+    favorite_name_editor: Option<FilenameEditor>,
+    favorite_edit_index: Option<usize>,
     move_basename: Option<OsString>,
     notice: Option<String>,
     move_error: Option<String>,
@@ -80,6 +88,7 @@ impl App {
             .into_iter()
             .partition(|entry| ignored.contains(entry));
         let selection = Selection::new(entries.len());
+        let favorites = Favorites::load(home.clone());
         let inbox_path = home.join("Downloads");
         Self {
             delete_review: None,
@@ -95,6 +104,8 @@ impl App {
             entries,
             other_entries,
             ignored,
+            configuration_selection: Selection::new(favorites.entries().len()),
+            favorites,
             viewing_ignored: false,
             selection,
             marks: InboxMarks::default(),
@@ -103,6 +114,8 @@ impl App {
             proposed_move: None,
             source_identity: None,
             rename_editor: None,
+            favorite_name_editor: None,
+            favorite_edit_index: None,
             move_basename: None,
             notice: None,
             move_error: None,
@@ -119,6 +132,26 @@ impl App {
 
     pub fn ignored_warning(&self) -> Option<&str> {
         self.ignored.warning()
+    }
+
+    pub fn favorites(&self) -> &[FavoriteDestination] {
+        self.favorites.entries()
+    }
+
+    pub fn favorite_selected(&self) -> Option<usize> {
+        self.configuration_selection.index()
+    }
+
+    pub fn favorite_name(&self) -> Option<OsString> {
+        self.favorite_name_editor.as_ref().map(FilenameEditor::name)
+    }
+
+    pub fn favorites_warning(&self) -> Option<&str> {
+        self.favorites.warning()
+    }
+
+    pub fn favorite_available(&self, favorite: &FavoriteDestination) -> bool {
+        self.favorites.available(favorite)
     }
 
     pub fn entries(&self) -> &[InboxEntry] {
@@ -227,11 +260,41 @@ impl App {
                 self.handle_rename_editor(key);
                 return;
             }
+            if self.screen == Screen::FavoriteNameEditor {
+                self.handle_favorite_name_editor(key);
+                return;
+            }
             if key.code != KeyCode::Char('g') {
                 self.pending_g = false;
             }
             match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('C') if self.screen == Screen::Inbox => {
+                    self.marks.exit_visual();
+                    self.configuration_selection = Selection::new(self.favorites.entries().len());
+                    self.screen = Screen::Configuration;
+                }
+                KeyCode::Char('a') if self.screen == Screen::Configuration => {
+                    self.start_favorite_name_edit(None);
+                }
+                KeyCode::Char('e') | KeyCode::Enter if self.screen == Screen::Configuration => {
+                    self.start_favorite_name_edit(self.favorite_selected());
+                }
+                KeyCode::Char('x') if self.screen == Screen::Configuration => {
+                    self.remove_favorite();
+                }
+                KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::Configuration => {
+                    self.configuration_selection
+                        .move_down(self.favorites.entries().len());
+                }
+                KeyCode::Char('k') | KeyCode::Up if self.screen == Screen::Configuration => {
+                    self.configuration_selection.move_up();
+                }
+                KeyCode::Char('G') if self.screen == Screen::Configuration => {
+                    self.configuration_selection
+                        .move_to_last(self.favorites.entries().len());
+                }
+                KeyCode::Esc if self.screen == Screen::Configuration => self.screen = Screen::Inbox,
                 KeyCode::Char('D') if self.screen == Screen::Inbox && !self.viewing_ignored => {
                     if self.marks.count() > 1 {
                         self.start_removal_batch(BatchAction::Delete);
@@ -355,9 +418,15 @@ impl App {
                     self.screen = Screen::DestinationBrowser;
                 }
                 KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right
-                    if self.screen == Screen::DestinationBrowser =>
+                    if matches!(
+                        self.screen,
+                        Screen::DestinationBrowser | Screen::FavoriteDestinationBrowser
+                    ) =>
                 {
                     self.destination_browser.enter_selected();
+                }
+                KeyCode::Char('d') if self.screen == Screen::FavoriteDestinationBrowser => {
+                    self.save_favorite();
                 }
                 KeyCode::Char('d') if self.screen == Screen::DestinationBrowser => {
                     if !self.bulk_targets.is_empty() {
@@ -377,6 +446,9 @@ impl App {
                 }
                 KeyCode::Esc if self.screen == Screen::DestinationBrowser => {
                     self.screen = Screen::Inbox;
+                }
+                KeyCode::Esc if self.screen == Screen::FavoriteDestinationBrowser => {
+                    self.screen = Screen::FavoriteNameEditor;
                 }
                 KeyCode::Esc if self.screen == Screen::MovePreview => {
                     if self.move_error.is_some() {
@@ -406,14 +478,27 @@ impl App {
                         self.attempt_move();
                     }
                 }
-                KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::DestinationBrowser => {
+                KeyCode::Char('j') | KeyCode::Down
+                    if matches!(
+                        self.screen,
+                        Screen::DestinationBrowser | Screen::FavoriteDestinationBrowser
+                    ) =>
+                {
                     self.destination_browser.move_down();
                 }
-                KeyCode::Char('k') | KeyCode::Up if self.screen == Screen::DestinationBrowser => {
+                KeyCode::Char('k') | KeyCode::Up
+                    if matches!(
+                        self.screen,
+                        Screen::DestinationBrowser | Screen::FavoriteDestinationBrowser
+                    ) =>
+                {
                     self.destination_browser.move_up();
                 }
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace
-                    if self.screen == Screen::DestinationBrowser =>
+                    if matches!(
+                        self.screen,
+                        Screen::DestinationBrowser | Screen::FavoriteDestinationBrowser
+                    ) =>
                 {
                     self.destination_browser.enter_parent();
                 }
@@ -424,7 +509,13 @@ impl App {
                     self.selection.move_up();
                 }
                 KeyCode::Char('g')
-                    if matches!(self.screen, Screen::Inbox | Screen::DestinationBrowser) =>
+                    if matches!(
+                        self.screen,
+                        Screen::Inbox
+                            | Screen::DestinationBrowser
+                            | Screen::FavoriteDestinationBrowser
+                            | Screen::Configuration
+                    ) =>
                 {
                     if self.pending_g {
                         match self.screen {
@@ -432,6 +523,12 @@ impl App {
                             Screen::DestinationBrowser => {
                                 self.destination_browser.move_to_first();
                             }
+                            Screen::FavoriteDestinationBrowser => {
+                                self.destination_browser.move_to_first()
+                            }
+                            Screen::Configuration => self
+                                .configuration_selection
+                                .move_to_first(self.favorites.entries().len()),
                             Screen::DeleteConfirmation
                             | Screen::TrashPreview
                             | Screen::MovePreview
@@ -440,7 +537,8 @@ impl App {
                             | Screen::RenamePreview
                             | Screen::BulkPreview
                             | Screen::BulkProgress
-                            | Screen::BulkResult => {}
+                            | Screen::BulkResult
+                            | Screen::FavoriteNameEditor => {}
                         }
                         self.pending_g = false;
                     } else {
@@ -451,6 +549,9 @@ impl App {
                     self.selection.move_to_last(self.entries.len());
                 }
                 KeyCode::Char('G') if self.screen == Screen::DestinationBrowser => {
+                    self.destination_browser.move_to_last();
+                }
+                KeyCode::Char('G') if self.screen == Screen::FavoriteDestinationBrowser => {
                     self.destination_browser.move_to_last();
                 }
                 _ => {}
@@ -468,6 +569,120 @@ impl App {
 
     pub(crate) fn batch(&self) -> Option<&Batch> {
         self.batch.as_ref()
+    }
+
+    fn start_favorite_name_edit(&mut self, index: Option<usize>) {
+        let name = index
+            .and_then(|selected| self.favorites.entries().get(selected))
+            .map(|favorite| OsString::from(favorite.name()))
+            .unwrap_or_default();
+        self.favorite_name_editor = Some(FilenameEditor::new(&name));
+        self.favorite_edit_index = index;
+        self.move_error = None;
+        self.screen = Screen::FavoriteNameEditor;
+    }
+
+    fn handle_favorite_name_editor(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.favorite_name_editor = None;
+                self.favorite_edit_index = None;
+                self.move_error = None;
+                self.screen = Screen::Configuration;
+            }
+            KeyCode::Enter => {
+                let Some(name) = self
+                    .favorite_name()
+                    .and_then(|name| name.into_string().ok())
+                else {
+                    self.move_error = Some("Favorite names must be valid Unicode text".into());
+                    return;
+                };
+                if name.is_empty() {
+                    self.move_error = Some("Favorite name cannot be empty".into());
+                    return;
+                }
+                self.move_error = None;
+                self.destination_browser.refresh();
+                self.screen = Screen::FavoriteDestinationBrowser;
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                self.favorite_name_editor
+                    .as_mut()
+                    .expect("favorite editor exists")
+                    .clear();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.favorite_name_editor
+                    .as_mut()
+                    .expect("favorite editor exists")
+                    .append(character);
+                self.move_error = None;
+            }
+            KeyCode::Backspace => {
+                self.favorite_name_editor
+                    .as_mut()
+                    .expect("favorite editor exists")
+                    .backspace();
+                self.move_error = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn save_favorite(&mut self) {
+        let Some(name) = self
+            .favorite_name()
+            .and_then(|name| name.into_string().ok())
+        else {
+            self.move_error = Some("Favorite names must be valid Unicode text".into());
+            self.screen = Screen::FavoriteNameEditor;
+            return;
+        };
+        let path = self.destination_browser.current().to_path_buf();
+        let edited_index = self.favorite_edit_index;
+        let result = match self.favorite_edit_index {
+            Some(index) => self.favorites.replace(index, name, path),
+            None => self.favorites.add(name, path),
+        };
+        match result {
+            Ok(()) => {
+                let count = self.favorites.entries().len();
+                self.configuration_selection.index = edited_index.or(count.checked_sub(1));
+                self.favorite_name_editor = None;
+                self.favorite_edit_index = None;
+                self.move_error = None;
+                self.notice = Some("Favorite Destination saved".into());
+                self.screen = Screen::Configuration;
+            }
+            Err(error) => {
+                self.move_error = Some(error.to_string());
+                self.screen = Screen::FavoriteNameEditor;
+            }
+        }
+    }
+
+    fn remove_favorite(&mut self) {
+        let Some(index) = self.favorite_selected() else {
+            return;
+        };
+        match self.favorites.remove(index) {
+            Ok(favorite) => {
+                self.configuration_selection
+                    .repair_after_removal(index, self.favorites.entries().len());
+                self.notice = Some(format!(
+                    "Removed Favorite Destination {:?}",
+                    favorite.name()
+                ));
+            }
+            Err(error) => {
+                self.notice = Some(format!("Cannot remove Favorite Destination: {error}"))
+            }
+        }
     }
 
     fn start_removal_batch(&mut self, action: BatchAction) {
@@ -1273,6 +1488,48 @@ mod tests {
         assert_eq!(app.destination_selected(), Some(0));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn configuration_adds_edits_deletes_and_reloads_favorites_without_affecting_inbox() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-favorites-{}",
+            std::process::id()
+        ));
+        let projects = home.join("Projects");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&projects).unwrap();
+        let mut app = App::new(Vec::new(), home.clone());
+
+        press(&mut app, KeyCode::Char('C'));
+        assert_eq!(app.screen(), Screen::Configuration);
+        press(&mut app, KeyCode::Char('a'));
+        for character in "Projects".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::FavoriteDestinationBrowser);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.screen(), Screen::Configuration);
+        assert_eq!(app.favorites()[0].name(), "Projects");
+        assert_eq!(app.favorites()[0].path(), projects);
+
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.favorites()[0].name(), "Projects2");
+        assert_eq!(
+            App::new(Vec::new(), home.clone()).favorites()[0].name(),
+            "Projects2"
+        );
+
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.favorites().is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen(), Screen::Inbox);
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

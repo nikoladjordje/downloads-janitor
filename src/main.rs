@@ -1,6 +1,7 @@
 mod app;
 mod batch;
 mod destination;
+mod favorites;
 mod filename_editor;
 mod ignored_entries;
 mod inbox;

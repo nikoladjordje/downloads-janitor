@@ -62,6 +62,7 @@ share one Destination and open Bulk Move Preview.
 | `R` | Refresh Inbox, reload ignored state, and reconcile marks |
 | `i` | Persistently ignore marked entries, or the highlighted entry |
 | `I` | Switch between Inbox and Ignored Entries |
+| `C` | Open Configuration and manage Favorite Destinations |
 | `q` | Quit and restore the terminal |
 
 ### Destination Browser
@@ -254,6 +255,22 @@ Success clears the consumed mark, refreshes Inbox, and selects near the old
 index. If refresh fails, the app still reports **Permanently deleted 1 entry**,
 removes the known-deleted row from its retained list, and warns that other rows
 may be stale. `R` retries the refresh.
+
+## Favorite Destinations
+
+Press uppercase `C` from Inbox to open **Configuration**. Favorites have a
+unique, case-sensitive name and an existing non-symlink directory at or below
+`$HOME`. Use `a` to add one, `Enter` or `e` to edit the highlighted Favorite,
+and `x` to remove it. Adding or editing first accepts the name, then reuses the
+Destination Browser; press `d` there to save the currently shown directory. A path
+that later disappears or becomes invalid remains visible as **unavailable** so
+it can be repaired or removed.
+
+Favorites are saved in
+`$HOME/.config/downloads-janitor/configuration-v1` and reload on restart. An
+unreadable configuration is left untouched and displayed as a warning; repair
+it before changing Favorites. Favorites are only configuration in this slice:
+they do not yet alter manual move, rename, ignore, Trash, or deletion workflows.
 
 ## Send an entry to Trash
 
@@ -508,11 +525,16 @@ the verified workflow, expected filesystem results, and remaining limitations.
 
 ### Milestone 5 — Configuration and Rules
 
-The proposed fifth milestone will introduce user-controlled configuration,
-favorite Destinations, and deterministic organization rules. Rules will remain
-explicit and understandable rather than using AI classification. Configuration
-format, rule precedence, matching behavior, and persistence are still to be
-designed.
+The fifth milestone will introduce user-controlled Configuration, Favorite
+Destinations, and deterministic organization Rules. Rules will suggest a
+Destination for review but never execute moves automatically. They will use
+case-sensitive basename globs and an explicit Any/File/Directory/Symlink kind
+filter; the first matching Rule wins, and unmatched or non-Unicode entries stay
+manual. Favorites must name Destinations beneath `$HOME`; stale Favorites are
+retained and reported. A dedicated TUI Configuration screen will manage the
+ordered Rules and Favorites, while invalid Configuration remains preserved for
+repair and manual Inbox actions remain available. Bulk moves continue to use one
+shared Destination.
 
 ### Milestone 6 — History, Undo, and Release Hardening
 

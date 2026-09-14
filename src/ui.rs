@@ -17,9 +17,13 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::TrashPreview => render_trash(frame, app),
         Screen::DeleteConfirmation => render_delete(frame, app),
         Screen::BulkPreview | Screen::BulkProgress | Screen::BulkResult => render_batch(frame, app),
-        Screen::DestinationBrowser => render_destination(frame, app),
+        Screen::DestinationBrowser | Screen::FavoriteDestinationBrowser => {
+            render_destination(frame, app)
+        }
         Screen::MovePreview | Screen::RenamePreview => render_preview(frame, app),
         Screen::RenameEditor | Screen::MoveNameEditor => render_rename_editor(frame, app),
+        Screen::Configuration => render_configuration(frame, app),
+        Screen::FavoriteNameEditor => render_favorite_name_editor(frame, app),
     }
 }
 
@@ -326,7 +330,7 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(if app.viewing_ignored() {
             "j/k ↑/↓ Navigate  gg Top  G Bottom  u Restore  I Inbox  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\nR Refresh"
         } else {
-            "j/k ↑/↓ Navigate  gg Top  G Bottom  Enter Choose  r Rename  t Trash  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\ni Ignore  I Ignored entries  R Refresh  D Delete permanently"
+            "j/k ↑/↓ Navigate  gg Top  G Bottom  Enter Choose  r Rename  t Trash  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\ni Ignore  I Ignored entries  C Configuration  R Refresh  D Delete permanently"
         })
         .alignment(Alignment::Right)
         .block(Block::default().borders(Borders::ALL)),
@@ -348,9 +352,13 @@ fn render_destination(frame: &mut Frame<'_>, app: &App) {
         .split(frame.area());
     frame.render_widget(
         Paragraph::new(destination.to_string_lossy()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Destination Browser"),
+            Block::default().borders(Borders::ALL).title(
+                if app.screen() == Screen::FavoriteDestinationBrowser {
+                    "Choose Favorite Destination"
+                } else {
+                    "Destination Browser"
+                },
+            ),
         ),
         areas[0],
     );
@@ -381,11 +389,97 @@ fn render_destination(frame: &mut Frame<'_>, app: &App) {
         .unwrap_or_default();
     frame.render_widget(
         Paragraph::new(format!(
-            "{error}j/k Navigate  gg Top  G Bottom  Enter/l Open  h/Backspace Parent  d Choose  Esc Back  q Quit"
+            "{error}j/k Navigate  gg Top  G Bottom  Enter/l Open  h/Backspace Parent  d {}  Esc Back  q Quit",
+            if app.screen() == Screen::FavoriteDestinationBrowser { "Save" } else { "Choose" },
         ))
         .alignment(Alignment::Right)
         .block(Block::default().borders(Borders::ALL)),
         areas[2],
+    );
+}
+
+fn render_configuration(frame: &mut Frame<'_>, app: &App) {
+    let areas = Layout::vertical([
+        Constraint::Length(
+            if app.favorites_warning().is_some() || app.notice().is_some() {
+                5
+            } else {
+                3
+            },
+        ),
+        Constraint::Fill(1),
+        Constraint::Length(3),
+    ])
+    .split(frame.area());
+    let status = app
+        .favorites_warning()
+        .or(app.notice())
+        .map(|message| format!("\n{message}"))
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} Favorite Destinations{status}",
+            app.favorites().len()
+        ))
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(Block::bordered().title("Configuration")),
+        areas[0],
+    );
+    let items = app
+        .favorites()
+        .iter()
+        .map(|favorite| {
+            let available = app.favorites_warning().is_none() && app.favorite_available(favorite);
+            let suffix = if available { "" } else { " (unavailable)" };
+            ListItem::new(format!(
+                "{}: {:?}{suffix}",
+                favorite.name(),
+                favorite.path()
+            ))
+            .style(if available {
+                Style::default()
+            } else {
+                Style::default().fg(Color::Yellow)
+            })
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
+        .highlight_symbol("> ")
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default();
+    state.select(app.favorite_selected());
+    frame.render_stateful_widget(list, areas[1], &mut state);
+    frame.render_widget(
+        Paragraph::new(
+            "j/k ↑/↓ Navigate  gg Top  G Bottom  a Add  Enter/e Edit  x Delete  Esc Inbox  q Quit",
+        )
+        .alignment(Alignment::Right)
+        .block(Block::bordered()),
+        areas[2],
+    );
+}
+
+fn render_favorite_name_editor(frame: &mut Frame<'_>, app: &App) {
+    let name = app.favorite_name().expect("favorite editor has a name");
+    let mut lines = vec![
+        Line::from(format!("Name: {name:?}")),
+        Line::from("Type a unique, case-sensitive Favorite name."),
+        Line::from("Backspace removes the last character; Ctrl+u clears."),
+        Line::default(),
+        Line::from("Enter Choose Destination    Esc Cancel"),
+    ];
+    if let Some(error) = app.move_error() {
+        lines.push(Line::from(Span::styled(
+            error,
+            Style::default().fg(Color::Red),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::bordered().title("Favorite Destination Name")),
+        frame.area(),
     );
 }
 
