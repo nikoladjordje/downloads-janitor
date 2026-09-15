@@ -327,26 +327,60 @@ impl App {
                 KeyCode::Char('C') if self.screen == Screen::Inbox => {
                     self.marks.exit_visual();
                     self.configuration_selection = Selection::new(self.favorites.entries().len());
+                    self.rule_selection = Selection::new(self.favorites.rules().len());
                     self.screen = Screen::Configuration;
                 }
-                KeyCode::Char('a') if self.screen == Screen::Configuration => {
+                KeyCode::Char('R') if self.screen == Screen::Configuration => {
+                    self.reload_configuration();
+                }
+                KeyCode::Char('a')
+                    if self.screen == Screen::Configuration
+                        && self.favorites.warning().is_none() =>
+                {
                     self.start_favorite_name_edit(None);
                 }
-                KeyCode::Char('e') | KeyCode::Enter if self.screen == Screen::Configuration => {
+                KeyCode::Char('e') | KeyCode::Enter
+                    if self.screen == Screen::Configuration
+                        && self.favorites.warning().is_none() =>
+                {
                     self.start_favorite_name_edit(self.favorite_selected());
                 }
-                KeyCode::Char('x') if self.screen == Screen::Configuration => {
+                KeyCode::Char('x')
+                    if self.screen == Screen::Configuration
+                        && self.favorites.warning().is_none() =>
+                {
                     self.remove_favorite();
                 }
-                KeyCode::Char('A') if self.screen == Screen::Configuration => {
+                KeyCode::Char('A')
+                    if self.screen == Screen::Configuration
+                        && self.favorites.warning().is_none() =>
+                {
                     self.start_rule_edit(None)
                 }
-                KeyCode::Char('E') if self.screen == Screen::Configuration => {
+                KeyCode::Char('E')
+                    if self.screen == Screen::Configuration
+                        && self.favorites.warning().is_none() =>
+                {
                     self.start_rule_edit(self.rule_selected())
                 }
-                KeyCode::Char('X') if self.screen == Screen::Configuration => self.remove_rule(),
-                KeyCode::Char(']') if self.screen == Screen::Configuration => self.move_rule(1),
-                KeyCode::Char('[') if self.screen == Screen::Configuration => self.move_rule(-1),
+                KeyCode::Char('X')
+                    if self.screen == Screen::Configuration
+                        && self.favorites.warning().is_none() =>
+                {
+                    self.remove_rule()
+                }
+                KeyCode::Char(']')
+                    if self.screen == Screen::Configuration
+                        && self.favorites.warning().is_none() =>
+                {
+                    self.move_rule(1)
+                }
+                KeyCode::Char('[')
+                    if self.screen == Screen::Configuration
+                        && self.favorites.warning().is_none() =>
+                {
+                    self.move_rule(-1)
+                }
                 KeyCode::Char('j') | KeyCode::Down if self.screen == Screen::Configuration => {
                     self.configuration_selection
                         .move_down(self.favorites.entries().len());
@@ -1170,6 +1204,17 @@ impl App {
             .collect();
     }
 
+    fn reload_configuration(&mut self) {
+        let had_error = self.favorites.warning().is_some();
+        self.favorites.reload();
+        self.configuration_selection = Selection::new(self.favorites.entries().len());
+        self.rule_selection = Selection::new(self.favorites.rules().len());
+        self.evaluate_rule_matches();
+        if had_error && self.favorites.warning().is_none() {
+            self.notice = Some("Configuration reloaded; suggestions restored".into());
+        }
+    }
+
     fn prepare_individual_action(&mut self) -> bool {
         if self.marks.count() > 1 {
             self.notice =
@@ -1204,6 +1249,7 @@ impl App {
 
     fn refresh_inbox(&mut self) {
         self.marks.exit_visual();
+        self.reload_configuration();
         let former_index = self.selected().unwrap_or(0);
         let former = self.selected().map(|index| {
             let entry = &self.entries[index];
@@ -1946,6 +1992,58 @@ mod tests {
         assert_eq!(app.proposed_move().unwrap().destination(), home);
         assert_eq!(app.active_suggestion().unwrap().path(), suggested);
         assert!(downloads.join("report.txt").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn repaired_configuration_reloads_suggestions_without_blocking_manual_moves() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-configuration-recovery-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        let projects = home.join("Projects");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::create_dir(&projects).unwrap();
+        fs::write(downloads.join("report.txt"), b"keep").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+        app.favorites.add("projects".into(), projects).unwrap();
+        app.favorites
+            .add_rule("*.txt".into(), RuleKind::File, "projects".into())
+            .unwrap();
+        app.evaluate_rule_matches();
+        let configuration = home.join(".config/downloads-janitor/configuration-v1");
+        let repaired = fs::read(&configuration).unwrap();
+
+        fs::write(&configuration, b"not a configuration\n").unwrap();
+        press(&mut app, KeyCode::Char('R'));
+        assert!(
+            app.favorites_warning()
+                .unwrap()
+                .contains("missing or unsupported")
+        );
+        assert_eq!(app.rule_match(0), Some(&RuleMatch::Unmatched));
+
+        press(&mut app, KeyCode::Char('C'));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.screen(), Screen::Configuration, "writes stay disabled");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.screen(),
+            Screen::DestinationBrowser,
+            "manual moves remain available"
+        );
+        press(&mut app, KeyCode::Esc);
+
+        fs::write(&configuration, repaired).unwrap();
+        press(&mut app, KeyCode::Char('R'));
+        assert_eq!(app.favorites_warning(), None);
+        assert!(matches!(app.rule_match(0), Some(RuleMatch::Suggested(_))));
+        assert_eq!(app.notice(), Some("Inbox refreshed"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::MovePreview);
         fs::remove_dir_all(home).unwrap();
     }
 

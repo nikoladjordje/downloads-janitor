@@ -416,7 +416,7 @@ fn render_configuration(frame: &mut Frame<'_>, app: &App) {
     let areas = Layout::vertical([
         Constraint::Length(
             if app.favorites_warning().is_some() || app.notice().is_some() {
-                5
+                7
             } else {
                 3
             },
@@ -514,9 +514,11 @@ fn render_configuration(frame: &mut Frame<'_>, app: &App) {
         &mut rule_state,
     );
     frame.render_widget(
-        Paragraph::new(
-            "Favorites: a/e/x, j/k. Rules: A/E/X, J/K select, [/] reorder. Esc Inbox  q Quit",
-        )
+        Paragraph::new(if app.favorites_warning().is_some() {
+            "Configuration is read-only. Repair its file, then R Reload. Esc Inbox  q Quit"
+        } else {
+            "Favorites: a/e/x, j/k. Rules: A/E/X, J/K select, [/] reorder. R Reload  Esc Inbox  q Quit"
+        })
         .alignment(Alignment::Right)
         .block(Block::bordered()),
         areas[2],

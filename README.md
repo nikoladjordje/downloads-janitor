@@ -106,6 +106,7 @@ open Preview.
 | Bulk review | Enter executes (deletion requires typed `delete` first), Esc goes back; arrows scroll/pan, Page Up/Down page, Home resets; `j/k`, `h/l`, and `q` work except when entering deletion text |
 | Bulk progress | Esc stops before the next entry; other keys have no effect |
 | Bulk results | Enter or Esc returns to Inbox, `q` quits; `j/k` or arrows scroll, `h/l` or arrows pan, Page Up/Down page, Home resets |
+| Configuration | Favorites: `a`/`e`/`x`; Rules: `A`/`E`/`X`, `J`/`K`, `[`/`]`; `R` reloads Configuration after an external repair; Esc returns to Inbox |
 
 ## Select and refresh Inbox Entries
 
@@ -277,9 +278,12 @@ Rules do not yet change manual move, rename, ignore, Trash, or deletion
 workflows.
 
 Favorites and Rules are saved in
-`$HOME/.config/downloads-janitor/configuration-v1` and reload on restart. An
-unreadable configuration is left untouched and displayed as a warning; repair
-it before changing Configuration.
+`$HOME/.config/downloads-janitor/configuration-v1` and reload on restart. A
+malformed or unreadable Configuration is left untouched, and Configuration
+shows the specific problem and disables its editing controls and Rule
+suggestions. Manual moves, renames, ignore/restore, Trash, and permanent
+deletion remain available. Repair the file outside the application, then press
+`R` from Inbox or Configuration to reload it and restore suggestions.
 
 ## Send an entry to Trash
 

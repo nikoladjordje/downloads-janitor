@@ -107,19 +107,29 @@ impl Favorites {
             rules: Vec::new(),
             warning: None,
         };
-        match read(&favorites.path).and_then(|contents| decode(&contents)) {
+        favorites.reload();
+        favorites
+    }
+
+    /// Reloads Configuration from disk. A bad on-disk Configuration remains
+    /// untouched and clears loaded Rules so they cannot suggest destinations
+    /// until the user repairs it and reloads again.
+    pub fn reload(&mut self) {
+        match read(&self.path).and_then(|contents| decode(&contents)) {
             Ok((entries, rules)) => {
-                favorites.entries = entries;
-                favorites.rules = rules;
+                self.entries = entries;
+                self.rules = rules;
+                self.warning = None;
             }
             Err(error) => {
-                favorites.warning = Some(format!(
-                    "Configuration is unreadable; Favorites cannot be changed. {error}. Repair {:?}",
-                    favorites.path
+                self.entries.clear();
+                self.rules.clear();
+                self.warning = Some(format!(
+                    "Configuration error: {error}. Repair {:?}, then press R to reload",
+                    self.path
                 ));
             }
         }
-        favorites
     }
 
     pub fn entries(&self) -> &[FavoriteDestination] {
@@ -287,10 +297,13 @@ impl Favorites {
         }
     }
 
-    fn ensure_writable(&self) -> io::Result<()> {
+    fn ensure_writable(&mut self) -> io::Result<()> {
+        // Re-read before writing so an externally introduced malformed file is
+        // never replaced by a configuration edit from this process.
+        self.reload();
         if self.warning.is_some() {
             Err(io::Error::other(
-                "Configuration is unreadable; repair it before changing Favorites",
+                "Configuration has errors; repair it and reload before changing Favorites or Rules",
             ))
         } else {
             Ok(())
@@ -413,46 +426,65 @@ fn encode(entries: &[FavoriteDestination], rules: &[Rule]) -> Vec<u8> {
 }
 
 fn decode(bytes: &[u8]) -> io::Result<(Vec<FavoriteDestination>, Vec<Rule>)> {
-    let invalid = || io::Error::other("invalid configuration format");
-    let text = std::str::from_utf8(bytes).map_err(|_| invalid())?;
-    let body = text.strip_prefix(HEADER).ok_or_else(invalid)?;
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| io::Error::other("configuration is not valid UTF-8"))?;
+    let body = text
+        .strip_prefix(HEADER)
+        .ok_or_else(|| io::Error::other("missing or unsupported configuration header"))?;
     if !body.is_empty() && !body.ends_with('\n') {
-        return Err(invalid());
+        return Err(io::Error::other(
+            "final configuration line is not newline-terminated",
+        ));
     }
     let mut entries = Vec::new();
     let mut rules = Vec::new();
-    for line in body.lines() {
+    for (index, line) in body.lines().enumerate() {
+        let line_number = index + 2;
+        let invalid = |problem: &str| io::Error::other(format!("line {line_number}: {problem}"));
         let fields = line.split(' ').collect::<Vec<_>>();
         match fields.as_slice() {
             ["favorite", name, path] => {
-                let name = String::from_utf8(unhex(name).map_err(|_| invalid())?)
-                    .map_err(|_| invalid())?;
-                validate_name(&name).map_err(|_| invalid())?;
-                let path = PathBuf::from(OsString::from_vec(unhex(path).map_err(|_| invalid())?));
-                if !path.is_absolute()
-                    || entries
-                        .iter()
-                        .any(|favorite: &FavoriteDestination| favorite.name == name)
+                let name = String::from_utf8(
+                    unhex(name).map_err(|_| invalid("Favorite name is not hexadecimal UTF-8"))?,
+                )
+                .map_err(|_| invalid("Favorite name is not valid UTF-8"))?;
+                validate_name(&name).map_err(|_| invalid("Favorite name cannot be empty"))?;
+                let path = PathBuf::from(OsString::from_vec(
+                    unhex(path).map_err(|_| invalid("Favorite path is not hexadecimal"))?,
+                ));
+                if !path.is_absolute() {
+                    return Err(invalid("Favorite path must be absolute"));
+                }
+                if entries
+                    .iter()
+                    .any(|favorite: &FavoriteDestination| favorite.name == name)
                 {
-                    return Err(invalid());
+                    return Err(invalid("Favorite names must be unique"));
                 }
                 entries.push(FavoriteDestination { name, path });
             }
             ["rule", pattern, kind, favorite_name] => {
-                let pattern = String::from_utf8(unhex(pattern).map_err(|_| invalid())?)
-                    .map_err(|_| invalid())?;
-                let favorite_name = String::from_utf8(unhex(favorite_name).map_err(|_| invalid())?)
-                    .map_err(|_| invalid())?;
+                let pattern = String::from_utf8(
+                    unhex(pattern).map_err(|_| invalid("Rule pattern is not hexadecimal UTF-8"))?,
+                )
+                .map_err(|_| invalid("Rule pattern is not valid UTF-8"))?;
+                let favorite_name = String::from_utf8(
+                    unhex(favorite_name)
+                        .map_err(|_| invalid("Rule Favorite name is not hexadecimal UTF-8"))?,
+                )
+                .map_err(|_| invalid("Rule Favorite name is not valid UTF-8"))?;
                 if pattern.is_empty() || favorite_name.is_empty() {
-                    return Err(invalid());
+                    return Err(invalid("Rule pattern and Favorite name cannot be empty"));
                 }
                 rules.push(Rule {
                     pattern,
-                    kind: RuleKind::decode(kind).ok_or_else(invalid)?,
+                    kind: RuleKind::decode(kind).ok_or_else(|| {
+                        invalid("Rule kind must be any, file, directory, or symlink")
+                    })?,
                     favorite_name,
                 });
             }
-            _ => return Err(invalid()),
+            _ => return Err(invalid("expected a Favorite or Rule record")),
         }
     }
     Ok((entries, rules))
@@ -588,5 +620,27 @@ mod tests {
         }];
         let (_, decoded) = decode(&encode(&[], &rules)).unwrap();
         assert_eq!(decoded, rules);
+    }
+
+    #[test]
+    fn malformed_configuration_is_preserved_with_a_specific_error_until_repaired() {
+        let home = TestDirectory::new();
+        let configuration = home.0.join(".config/downloads-janitor/configuration-v1");
+        fs::create_dir_all(configuration.parent().unwrap()).unwrap();
+        let broken = b"downloads-janitor-configuration-v1\nfavorite nope 2f746d70\n";
+        fs::write(&configuration, broken).unwrap();
+
+        let mut favorites = Favorites::load(home.0.clone());
+        assert!(favorites.warning().unwrap().contains("line 2"));
+        assert!(favorites.warning().unwrap().contains("Favorite name"));
+        assert!(favorites.entries().is_empty());
+        assert!(favorites.rules().is_empty());
+        assert!(favorites.add("new".into(), home.0.clone()).is_err());
+        assert_eq!(fs::read(&configuration).unwrap(), broken);
+
+        fs::write(&configuration, encode(&[], &[])).unwrap();
+        favorites.reload();
+        assert_eq!(favorites.warning(), None);
+        favorites.add("home".into(), home.0.clone()).unwrap();
     }
 }
