@@ -2,9 +2,10 @@
 
 Downloads Janitor is a keyboard-driven Linux terminal application for reviewing
 entries in `~/Downloads` and safely moving selected entries to a directory
-beneath `$HOME`. Milestones 1–4 provide reviewed same-filesystem moves without
+beneath `$HOME`. Milestones 1–5 provide reviewed same-filesystem moves without
 overwriting, individual renaming, selection and bulk actions, persistent
-ignore/restore, desktop Trash, and typed confirmation for permanent deletion.
+ignore/restore, desktop Trash, typed confirmation for permanent deletion, and
+reviewable rule-based Destination suggestions.
 
 ## Requirements
 
@@ -279,13 +280,17 @@ it can be repaired or removed.
 
 Rules are ordered, deterministic instructions made of a non-empty basename
 pattern, an Entry Kind (`Any`, `File`, `Directory`, or `Symlink`), and a
-reference to a Favorite by name. In Configuration, use uppercase `A`, `E`, and
-`X` to add, edit, and remove Rules; uppercase `J`/`K` selects a Rule and `[`/`]
-reorders it. The list shows its first-match-wins order. A Rule never duplicates
-a Favorite path. If a Favorite is removed, renamed, or becomes unavailable,
-the Rule is retained and visibly reported as missing or unavailable for repair.
-Rules do not yet change manual move, rename, ignore, Trash, or deletion
-workflows.
+reference to a Favorite by name. Patterns are case-sensitive globs evaluated
+only against Unicode basenames: `*` matches any sequence, `?` one character,
+and bracket classes such as `[a-z]` or `[!a-z]` match one character. An unclosed
+`[` is literal. Non-Unicode basenames stay manual. In Configuration, use
+uppercase `A`, `E`, and `X` to add, edit, and remove Rules; uppercase `J`/`K`
+selects a Rule and `[`/`]` reorders it. The list shows its first-match-wins
+order. A Rule never duplicates a Favorite path. If a Favorite is removed,
+renamed, or becomes unavailable, the Rule is retained and visibly reported as
+missing or unavailable for repair. Rules only suggest a Destination for an
+individual reviewed move; they never change the filesystem or alter manual
+rename, ignore, Trash, or deletion workflows.
 
 Favorites and Rules are saved in
 `$HOME/.config/downloads-janitor/configuration-v1` and reload on restart. A
@@ -505,16 +510,16 @@ the known-moved source from its retained list, and reports both success and that
 the remaining entries may be stale.
 
 Downloads Janitor does not provide cross-filesystem copy-then-delete, overwrite,
-merge or collision resolution,
-undo or rollback, queues, configuration or rules, bulk rename, recursive Inbox
-scanning or organization, filesystem watching, timers, or background work.
+merge or collision resolution, undo or rollback, queues, bulk rename, recursive
+Inbox scanning or organization, filesystem watching, timers, background work,
+or automatic rule execution.
 Explicit permanent deletion of a directory does recursively remove its contents.
 
 ## Roadmap
 
-Milestones 1 through 4 are implemented and verified. Milestone 4 delivers
-efficient manual Inbox processing; configuration and rules remain Milestone 5,
-and history/undo remain Milestone 6. Both later milestones are proposed directions.
+Milestones 1 through 5 are implemented and verified. Milestone 4 delivers
+efficient manual Inbox processing, Milestone 5 adds reviewable Configuration
+and Rules, and history/undo remains the proposed direction for Milestone 6.
 
 ### Milestone 1 — Read-Only Inbox Review
 
@@ -548,16 +553,17 @@ the verified workflow, expected filesystem results, and remaining limitations.
 
 ### Milestone 5 — Configuration and Rules
 
-The fifth milestone will introduce user-controlled Configuration, Favorite
-Destinations, and deterministic organization Rules. Rules will suggest a
-Destination for review but never execute moves automatically. They will use
-case-sensitive basename globs and an explicit Any/File/Directory/Symlink kind
-filter; the first matching Rule wins, and unmatched or non-Unicode entries stay
-manual. Favorites must name Destinations beneath `$HOME`; stale Favorites are
-retained and reported. A dedicated TUI Configuration screen will manage the
-ordered Rules and Favorites, while invalid Configuration remains preserved for
-repair and manual Inbox actions remain available. Bulk moves continue to use one
-shared Destination.
+The fifth milestone adds user-controlled Configuration, Favorite Destinations,
+and deterministic organization Rules. Rules suggest a Destination for review
+but never execute moves automatically. They use case-sensitive basename globs
+and an explicit Any/File/Directory/Symlink kind filter; the first matching Rule
+wins, and unmatched, unavailable, or non-Unicode entries stay manual. Favorites
+name Destinations beneath `$HOME`; stale Favorites are retained and reported. A
+dedicated TUI Configuration screen manages ordered Rules and Favorites, while
+invalid Configuration remains preserved for repair and manual Inbox actions
+remain available. Bulk moves continue to use one shared Destination. The
+[Milestone 5 acceptance scenario](docs/milestone-5-acceptance.md) records the
+reproducible workflow and its limits.
 
 ### Milestone 6 — History, Undo, and Release Hardening
 
@@ -578,10 +584,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
-For a disposable terminal walkthrough, fixture setup, and recorded results, see
-[Milestone 4 acceptance](docs/milestone-4-acceptance.md). The combined workflow
-regression test can also be run alone:
+For disposable terminal walkthroughs, fixture setup, and recorded results, see
+[Milestone 4 acceptance](docs/milestone-4-acceptance.md) and
+[Milestone 5 acceptance](docs/milestone-5-acceptance.md). The Milestone 5
+configuration and suggestion coverage can also be run by name:
 
 ```bash
-cargo test milestone_four_mixed_workflow_survives_actions_and_restart
+cargo test configuration_manages_ordered_rules_that_reference_favorites
+cargo test rule_matches_use_first_ordered_basename_kind_match_and_leave_raw_names_manual
+cargo test suggested_destination_opens_a_reviewable_preview_and_can_be_overridden
+cargo test bulk_moves_explain_mixed_suggestions_and_use_one_chosen_destination
+cargo test repaired_configuration_reloads_suggestions_without_blocking_manual_moves
 ```
