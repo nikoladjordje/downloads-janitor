@@ -359,21 +359,31 @@ fn render_destination(frame: &mut Frame<'_>, app: &App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(if app.bulk_destination_guidance().is_some() {
+                6
+            } else {
+                3
+            }),
             Constraint::Fill(1),
             Constraint::Length(4),
         ])
         .split(frame.area());
     frame.render_widget(
-        Paragraph::new(destination.to_string_lossy()).block(
-            Block::default().borders(Borders::ALL).title(
-                if app.screen() == Screen::FavoriteDestinationBrowser {
-                    "Choose Favorite Destination"
-                } else {
-                    "Destination Browser"
-                },
-            ),
-        ),
+        Paragraph::new(format!(
+            "{}{}",
+            destination.to_string_lossy(),
+            app.bulk_destination_guidance()
+                .map(|guidance| format!("\n{guidance}"))
+                .unwrap_or_default()
+        ))
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(
+            if app.screen() == Screen::FavoriteDestinationBrowser {
+                "Choose Favorite Destination"
+            } else {
+                "Destination Browser"
+            },
+        )),
         areas[0],
     );
     let items = app

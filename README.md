@@ -39,7 +39,11 @@ Moving an entry uses three screens:
    Attempt directly.
 
 Returning to an earlier screen preserves its selection. Multiple marked entries
-share one Destination and open Bulk Move Preview.
+share one deliberately chosen Destination and open Bulk Move Preview. Rules
+never route a bulk move entry-by-entry: when marked entries have different (or
+only partial) suggestions, the Destination Browser explains that they must be
+processed separately to use those suggestions, or moved together to one shared
+Destination.
 
 ## Keybindings
 
@@ -141,11 +145,17 @@ Successful individual actions clear the consumed mark; cancelling preserves it.
 ## Move selected entries
 
 Mark two or more entries with Space, `V`, or `a`, then press `Enter` to browse
-for one Destination. Press `d` to open **Bulk Move Preview**. It lists every
+for one shared Destination. Press `d` to open **Bulk Move Preview**. It lists every
 exact source and resulting path, preserving all original basenames; bulk moves
 have no name editor. Use `j`/`k` or arrows to scroll, Page Up/Down to page,
 `h`/`l` or left/right arrows to pan long paths, and Home to return to the start.
 Quoted, escaped paths preserve exact filename bytes.
+
+Bulk moves do not automatically use Rule suggestions. If every selected entry
+has the same suggestion, the browser identifies it but still requires `d` to
+choose it (or another shared Destination). Different or partial suggestions are
+called out there; process those entries separately to follow their individual
+suggestions, or deliberately choose one shared Destination for the whole set.
 
 Press `Enter` to check the entire reviewed set again and execute only if every
 entry passes. Known collisions, missing or replaced sources, invalid Destinations,

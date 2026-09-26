@@ -51,6 +51,7 @@ pub struct App {
     pub(crate) trash_root: PathBuf,
     batch: Option<Batch>,
     bulk_targets: Vec<InboxEntry>,
+    bulk_destination_guidance: Option<String>,
     pub(crate) batch_scroll: (usize, u16),
     entries: Vec<InboxEntry>,
     other_entries: Vec<InboxEntry>,
@@ -111,6 +112,7 @@ impl App {
             ),
             batch: None,
             bulk_targets: Vec::new(),
+            bulk_destination_guidance: None,
             batch_scroll: (0, 0),
             entries,
             other_entries,
@@ -203,6 +205,10 @@ impl App {
 
     pub fn active_suggestion(&self) -> Option<&crate::rule_match::SuggestedDestination> {
         self.active_suggestion.as_ref()
+    }
+
+    pub fn bulk_destination_guidance(&self) -> Option<&str> {
+        self.bulk_destination_guidance.as_deref()
     }
 
     pub fn entries(&self) -> &[InboxEntry] {
@@ -520,17 +526,24 @@ impl App {
                 {
                     if self.marks.count() > 1 {
                         self.marks.exit_visual();
-                        self.bulk_targets = self
+                        let selected: Vec<_> = self
                             .entries
                             .iter()
-                            .filter(|entry| self.marked(entry))
-                            .cloned()
+                            .enumerate()
+                            .filter(|(_, entry)| self.marked(entry))
+                            .collect();
+                        self.bulk_destination_guidance =
+                            Self::describe_bulk_suggestions(&selected, &self.rule_matches);
+                        self.bulk_targets = selected
+                            .into_iter()
+                            .map(|(_, entry)| entry.clone())
                             .collect();
                         self.destination_browser.refresh();
                         self.screen = Screen::DestinationBrowser;
                         return;
                     }
                     self.bulk_targets.clear();
+                    self.bulk_destination_guidance = None;
                     self.batch = None;
                     if !self.prepare_individual_action() {
                         return;
@@ -589,6 +602,7 @@ impl App {
                 }
                 KeyCode::Esc if self.screen == Screen::DestinationBrowser => {
                     self.active_suggestion = None;
+                    self.bulk_destination_guidance = None;
                     self.screen = Screen::Inbox;
                 }
                 KeyCode::Esc if self.screen == Screen::FavoriteDestinationBrowser => {
@@ -1061,6 +1075,7 @@ impl App {
                 self.screen = Screen::Inbox;
                 self.batch = None;
                 self.bulk_targets.clear();
+                self.bulk_destination_guidance = None;
             }
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1202,6 +1217,39 @@ impl App {
             .iter()
             .map(|entry| self.favorites.suggested_match(entry))
             .collect();
+    }
+
+    fn describe_bulk_suggestions(
+        selected: &[(usize, &InboxEntry)],
+        matches: &[crate::rule_match::RuleMatch],
+    ) -> Option<String> {
+        let suggested = selected
+            .iter()
+            .filter_map(|(index, _)| match matches.get(*index) {
+                Some(crate::rule_match::RuleMatch::Suggested(suggestion)) => Some(suggestion),
+                Some(crate::rule_match::RuleMatch::Unmatched) | None => None,
+            })
+            .collect::<Vec<_>>();
+        if suggested.is_empty() {
+            return None;
+        }
+
+        let shared = suggested.first().is_some_and(|first| {
+            suggested
+                .iter()
+                .all(|suggestion| suggestion.path() == first.path())
+        });
+        if shared && suggested.len() == selected.len() {
+            Some(format!(
+                "All selected entries match Rule suggestions for {:?}. Bulk moves do not apply suggestions automatically; choose this or another one shared Destination with d.",
+                suggested[0].path()
+            ))
+        } else {
+            Some(
+                "Selected entries have different or partial Rule suggestions. Bulk moves never route entries individually; process entries separately to use their suggestions, or choose one shared Destination with d."
+                    .into(),
+            )
+        }
     }
 
     fn reload_configuration(&mut self) {
@@ -1992,6 +2040,61 @@ mod tests {
         assert_eq!(app.proposed_move().unwrap().destination(), home);
         assert_eq!(app.active_suggestion().unwrap().path(), suggested);
         assert!(downloads.join("report.txt").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn bulk_moves_explain_mixed_suggestions_and_use_one_chosen_destination() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-bulk-suggestions-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        let projects = home.join("Projects");
+        let archive = home.join("Archive");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::create_dir(&projects).unwrap();
+        fs::create_dir(&archive).unwrap();
+        fs::write(downloads.join("report.txt"), b"report").unwrap();
+        fs::write(downloads.join("notes.md"), b"notes").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+        app.favorites
+            .add("projects".into(), projects.clone())
+            .unwrap();
+        app.favorites
+            .add("archive".into(), archive.clone())
+            .unwrap();
+        app.favorites
+            .add_rule("*.txt".into(), RuleKind::File, "projects".into())
+            .unwrap();
+        app.favorites
+            .add_rule("*.md".into(), RuleKind::File, "archive".into())
+            .unwrap();
+        app.evaluate_rule_matches();
+
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::DestinationBrowser);
+        assert!(
+            app.bulk_destination_guidance()
+                .unwrap()
+                .contains("different or partial Rule suggestions")
+        );
+        assert_eq!(app.destination(), Some(home.as_path()));
+
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.screen(), Screen::BulkPreview);
+        let batch = app.batch().unwrap();
+        assert!(batch.entries.iter().all(|item| {
+            item.proposal.as_ref().unwrap().destination() == home
+                && item.proposal.as_ref().unwrap().destination() != projects
+                && item.proposal.as_ref().unwrap().destination() != archive
+        }));
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen(), Screen::DestinationBrowser);
+        assert!(app.bulk_destination_guidance().is_some());
         fs::remove_dir_all(home).unwrap();
     }
 
