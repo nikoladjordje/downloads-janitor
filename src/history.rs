@@ -60,6 +60,7 @@ pub struct HistoryRecord {
     source: PathBuf,
     current: PathBuf,
     identity: SourceIdentity,
+    reversed_at_ms: Option<u128>,
 }
 impl HistoryRecord {
     pub fn action(&self) -> HistoryAction {
@@ -73,6 +74,18 @@ impl HistoryRecord {
     }
     pub fn reversible(&self) -> bool {
         self.action != HistoryAction::Delete
+    }
+    pub fn reversed(&self) -> bool {
+        self.reversed_at_ms.is_some()
+    }
+    pub fn supports_rename_undo(&self) -> bool {
+        matches!(self.action, HistoryAction::Move | HistoryAction::Rename)
+    }
+    pub(crate) fn identity(&self) -> SourceIdentity {
+        self.identity
+    }
+    pub(crate) fn id(&self) -> &str {
+        &self.id
     }
 }
 
@@ -104,7 +117,49 @@ impl History {
         self.warning.as_deref()
     }
     pub fn newest_reversible(&self) -> Option<&HistoryRecord> {
-        self.records.iter().rfind(|record| record.reversible())
+        self.records
+            .iter()
+            .rfind(|record| record.reversible() && !record.reversed())
+    }
+    pub fn refresh(&mut self) -> io::Result<()> {
+        self.load_from_disk()
+    }
+    fn load_from_disk(&mut self) -> io::Result<()> {
+        match read(&self.path).and_then(|contents| decode(&contents)) {
+            Ok(records) => {
+                self.records = records;
+                self.warning = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.records.clear();
+                self.warning = Some(format!("History unavailable: {error}"));
+                Err(error)
+            }
+        }
+    }
+    pub fn mark_reversed(&mut self, id: &str) -> io::Result<()> {
+        let Some(record) = self.records.iter_mut().find(|record| record.id == id) else {
+            return Err(io::Error::other(
+                "the reviewed History record no longer exists",
+            ));
+        };
+        if record.reversed() {
+            return Err(io::Error::other(
+                "the reviewed History record is already reversed",
+            ));
+        }
+        record.reversed_at_ms = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_millis(),
+        );
+        if let Err(error) = self.save() {
+            self.reload();
+            return Err(error);
+        }
+        Ok(())
     }
     pub fn record(
         &mut self,
@@ -145,6 +200,7 @@ impl History {
             source,
             current,
             identity,
+            reversed_at_ms: None,
         });
         if self.records.len() > RECORD_LIMIT {
             self.records.drain(..self.records.len() - RECORD_LIMIT);
@@ -156,16 +212,7 @@ impl History {
         Ok(())
     }
     fn reload(&mut self) {
-        match read(&self.path).and_then(|contents| decode(&contents)) {
-            Ok(records) => {
-                self.records = records;
-                self.warning = None;
-            }
-            Err(error) => {
-                self.records.clear();
-                self.warning = Some(format!("History unavailable: {error}"));
-            }
-        }
+        let _ = self.load_from_disk();
     }
     fn save(&self) -> io::Result<()> {
         let parent = self.path.parent().expect("history path has a parent");
@@ -205,12 +252,17 @@ fn encode(records: &[HistoryRecord]) -> Vec<u8> {
     for record in records {
         let (device, inode, file_type) = record.identity.parts();
         text.push_str(&format!(
-            "record {} {} {} {} {} {device} {inode} {file_type}\n",
+            "record {} {} {} {} {} {device} {inode} {file_type} {}\n",
             record.id,
             record.timestamp_ms,
             record.action.encoded(),
             hex(record.source.as_os_str().as_bytes()),
-            hex(record.current.as_os_str().as_bytes())
+            hex(record.current.as_os_str().as_bytes()),
+            record
+                .reversed_at_ms
+                .map(|value| value.to_string())
+                .as_deref()
+                .unwrap_or("-")
         ));
     }
     text.into_bytes()
@@ -230,21 +282,46 @@ fn decode(bytes: &[u8]) -> io::Result<Vec<HistoryRecord>> {
     for (index, line) in body.lines().enumerate() {
         let invalid = |problem: &str| io::Error::other(format!("line {}: {problem}", index + 2));
         let fields = line.split(' ').collect::<Vec<_>>();
-        let [
-            "record",
-            id,
-            timestamp,
-            action,
-            source,
-            current,
-            device,
-            inode,
-            file_type,
-        ] = fields.as_slice()
-        else {
-            return Err(invalid("expected a History record"));
-        };
-        let path = |value: &&str| {
+        let (id, timestamp, action, source, current, device, inode, file_type, reversed_at) =
+            match fields.as_slice() {
+                [
+                    "record",
+                    id,
+                    timestamp,
+                    action,
+                    source,
+                    current,
+                    device,
+                    inode,
+                    file_type,
+                ] => (
+                    *id, *timestamp, *action, *source, *current, *device, *inode, *file_type, "-",
+                ),
+                [
+                    "record",
+                    id,
+                    timestamp,
+                    action,
+                    source,
+                    current,
+                    device,
+                    inode,
+                    file_type,
+                    reversed_at,
+                ] => (
+                    *id,
+                    *timestamp,
+                    *action,
+                    *source,
+                    *current,
+                    *device,
+                    *inode,
+                    *file_type,
+                    *reversed_at,
+                ),
+                _ => return Err(invalid("expected a History record")),
+            };
+        let path = |value: &str| {
             unhex(value)
                 .map(OsString::from_vec)
                 .map(PathBuf::from)
@@ -259,7 +336,7 @@ fn decode(bytes: &[u8]) -> io::Result<Vec<HistoryRecord>> {
         )
         .ok_or_else(|| invalid("file type is unsupported"))?;
         records.push(HistoryRecord {
-            id: (*id).to_owned(),
+            id: id.to_owned(),
             timestamp_ms: timestamp
                 .parse()
                 .map_err(|_| invalid("timestamp is invalid"))?,
@@ -267,6 +344,14 @@ fn decode(bytes: &[u8]) -> io::Result<Vec<HistoryRecord>> {
             source: path(source)?,
             current: path(current)?,
             identity,
+            reversed_at_ms: match reversed_at {
+                "-" => None,
+                value => Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid("reversal time is invalid"))?,
+                ),
+            },
         });
     }
     Ok(records)
@@ -320,6 +405,26 @@ mod tests {
             reloaded.newest_reversible().unwrap().action(),
             HistoryAction::Move
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reversed_record_persists_and_is_not_the_newest_undo_candidate() {
+        let root = root();
+        let source = root.join("before");
+        let current = root.join("after");
+        fs::write(&current, b"contents").unwrap();
+        let mut history = History::load(root.clone());
+        history
+            .record(HistoryAction::Move, source, current)
+            .unwrap();
+        let id = history.records()[0].id().to_owned();
+
+        history.mark_reversed(&id).unwrap();
+
+        let reloaded = History::load(root.clone());
+        assert!(reloaded.records()[0].reversed());
+        assert!(reloaded.newest_reversible().is_none());
         fs::remove_dir_all(root).unwrap();
     }
 }

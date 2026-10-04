@@ -24,6 +24,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::RenameEditor | Screen::MoveNameEditor => render_rename_editor(frame, app),
         Screen::Configuration => render_configuration(frame, app),
         Screen::History => render_history(frame, app),
+        Screen::UndoPreview => render_undo_preview(frame, app),
         Screen::FavoriteNameEditor => render_favorite_name_editor(frame, app),
         Screen::RulePatternEditor => render_rule_pattern_editor(frame, app),
         Screen::RuleKindPicker => render_rule_kind_picker(frame, app),
@@ -376,7 +377,9 @@ fn render_history(frame: &mut Frame<'_>, app: &App) {
                 "{} {} — {}{}",
                 record.action().label(),
                 if newest { "(newest)" } else { "" },
-                if record.reversible() {
+                if record.reversed() {
+                    "reversed"
+                } else if record.reversible() {
                     "reversible"
                 } else {
                     "not undoable"
@@ -408,11 +411,39 @@ fn render_history(frame: &mut Frame<'_>, app: &App) {
         lines.push(Line::from(format!("Now:  {:?}", current)));
         lines.push(Line::default());
     }
-    lines.push(Line::from("Esc Inbox    q Quit"));
+    lines.push(Line::from(
+        "Enter Undo newest Move/Rename    Esc Inbox    q Quit",
+    ));
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(ratatui::widgets::Wrap { trim: false })
             .block(Block::bordered().title("History")),
+        frame.area(),
+    );
+}
+
+fn render_undo_preview(frame: &mut Frame<'_>, app: &App) {
+    let record = app
+        .undo_preview_record()
+        .expect("Undo Preview always has a History record");
+    let validation = app
+        .undo_validation_error()
+        .unwrap_or("Fresh validation passed");
+    let controls = if app.undo_is_valid() {
+        "Enter Undo (changes filesystem)    Esc History    q Quit"
+    } else {
+        "Blocked; repair the condition, then Enter rechecks    Esc History    q Quit"
+    };
+    let content = format!(
+        "Recorded action: {}\nCurrent path: {:?}\nOriginal path: {:?}\n\nValidation: {validation}\n\n{controls}",
+        record.action().label(),
+        record.current(),
+        record.source(),
+    );
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::bordered().title("Undo Preview")),
         frame.area(),
     );
 }

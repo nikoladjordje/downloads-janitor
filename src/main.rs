@@ -14,6 +14,7 @@ mod rule_match;
 mod terminal;
 mod trash;
 mod ui;
+mod undo;
 
 use std::error::Error;
 

@@ -44,6 +44,33 @@ pub enum Screen {
     RuleKindPicker,
     RuleFavoritePicker,
     History,
+    UndoPreview,
+}
+
+#[derive(Clone)]
+struct UndoPreview {
+    record: HistoryRecord,
+    validation_error: Option<String>,
+}
+impl UndoPreview {
+    fn new(record: HistoryRecord) -> Self {
+        let validation_error = Self::validation_error(&record);
+        Self {
+            record,
+            validation_error,
+        }
+    }
+    fn refresh(&mut self) {
+        self.validation_error = Self::validation_error(&self.record);
+    }
+    fn valid(&self) -> bool {
+        self.validation_error.is_none()
+    }
+    fn validation_error(record: &HistoryRecord) -> Option<String> {
+        crate::undo::validate(record)
+            .err()
+            .map(|error| error.to_string())
+    }
 }
 
 pub struct App {
@@ -60,6 +87,7 @@ pub struct App {
     ignored: IgnoredEntries,
     favorites: Favorites,
     history: History,
+    undo_preview: Option<UndoPreview>,
     unrecorded_history: Vec<(HistoryAction, PathBuf, PathBuf)>,
     viewing_ignored: bool,
     selection: Selection,
@@ -129,6 +157,7 @@ impl App {
             active_suggestion: None,
             favorites,
             history: History::load(home.clone()),
+            undo_preview: None,
             unrecorded_history: Vec::new(),
             viewing_ignored: false,
             selection,
@@ -177,6 +206,18 @@ impl App {
 
     pub fn newest_history_record(&self) -> Option<&HistoryRecord> {
         self.history.newest_reversible()
+    }
+
+    pub fn undo_preview_record(&self) -> Option<&HistoryRecord> {
+        self.undo_preview.as_ref().map(|preview| &preview.record)
+    }
+    pub fn undo_validation_error(&self) -> Option<&str> {
+        self.undo_preview
+            .as_ref()
+            .and_then(|preview| preview.validation_error.as_deref())
+    }
+    pub fn undo_is_valid(&self) -> bool {
+        self.undo_preview.as_ref().is_some_and(UndoPreview::valid)
     }
 
     pub fn unrecorded_history(&self) -> &[(HistoryAction, PathBuf, PathBuf)] {
@@ -360,6 +401,12 @@ impl App {
                 }
                 KeyCode::Char('H') if self.screen == Screen::Inbox => self.screen = Screen::History,
                 KeyCode::Esc if self.screen == Screen::History => self.screen = Screen::Inbox,
+                KeyCode::Enter if self.screen == Screen::History => self.start_undo_preview(),
+                KeyCode::Esc if self.screen == Screen::UndoPreview => {
+                    self.undo_preview = None;
+                    self.screen = Screen::History;
+                }
+                KeyCode::Enter if self.screen == Screen::UndoPreview => self.attempt_undo(),
                 KeyCode::Char('R') if self.screen == Screen::Configuration => {
                     self.reload_configuration();
                 }
@@ -724,7 +771,8 @@ impl App {
                             | Screen::RulePatternEditor
                             | Screen::RuleKindPicker
                             | Screen::RuleFavoritePicker
-                            | Screen::History => {}
+                            | Screen::History
+                            | Screen::UndoPreview => {}
                         }
                         self.pending_g = false;
                     } else {
@@ -1714,6 +1762,92 @@ impl App {
                     action.label()
                 )
             })
+    }
+
+    fn start_undo_preview(&mut self) {
+        let Some(record) = self.history.newest_reversible().cloned() else {
+            self.notice = Some("No reversible History record is available".into());
+            return;
+        };
+        if !record.supports_rename_undo() {
+            self.notice = Some(format!(
+                "Newest reversible record is {}; its recovery is not available yet",
+                record.action().label()
+            ));
+            return;
+        }
+        self.undo_preview = Some(UndoPreview::new(record));
+        self.screen = Screen::UndoPreview;
+    }
+
+    fn attempt_undo(&mut self) {
+        let Some(reviewed) = self
+            .undo_preview
+            .as_ref()
+            .map(|preview| preview.record.clone())
+        else {
+            return;
+        };
+        if self.history.refresh().is_err()
+            || self
+                .history
+                .newest_reversible()
+                .is_none_or(|record| record.id() != reviewed.id())
+        {
+            self.undo_preview
+                .as_mut()
+                .expect("Undo preview exists")
+                .validation_error = Some(
+                "History changed since this Undo Preview; review the newest record again".into(),
+            );
+            return;
+        }
+        self.undo_preview
+            .as_mut()
+            .expect("Undo preview exists")
+            .refresh();
+        if !self.undo_is_valid() {
+            return;
+        }
+        if let Err(error) = crate::undo::execute(&reviewed) {
+            self.undo_preview
+                .as_mut()
+                .expect("Undo preview exists")
+                .validation_error = Some(error.to_string());
+            return;
+        }
+        if let Err(error) = self.history.mark_reversed(reviewed.id()) {
+            let rollback = move_execution::rename_noreplace(reviewed.source(), reviewed.current());
+            let message = match rollback {
+                Ok(()) => format!(
+                    "Undo was not completed because History could not mark it reversed; the filesystem was restored: {error}"
+                ),
+                Err(rollback_error) => format!(
+                    "Undo moved the entry but History could not mark it reversed, and restoring the filesystem failed: {error}; {rollback_error}"
+                ),
+            };
+            self.undo_preview
+                .as_mut()
+                .expect("Undo preview exists")
+                .validation_error = Some(message);
+            return;
+        }
+        let notice = match (self.inbox_scanner)(&self.inbox_path) {
+            Ok(entries) => {
+                self.replace_inbox_entries(entries);
+                "Undo completed successfully".to_owned()
+            }
+            Err(error) => format!(
+                "Undo completed successfully; Inbox refresh failed: {error}. Remaining entries may be stale"
+            ),
+        };
+        self.selection.index = self
+            .entries
+            .iter()
+            .position(|entry| entry.path() == reviewed.source());
+        self.undo_preview = None;
+        self.screen = Screen::Inbox;
+        self.notice = Some(notice);
     }
 
     fn record_deletion_history(
@@ -4615,6 +4749,91 @@ mod tests {
         assert_eq!(reloaded.history_records().len(), 2);
         assert_eq!(reloaded.history_records()[0].source(), downloads.join("a"));
         assert_eq!(reloaded.history_records()[1].source(), downloads.join("b"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn undo_preview_reverses_the_newest_move_after_fresh_validation() {
+        let home =
+            std::env::temp_dir().join(format!("downloads-janitor-app-undo-{}", std::process::id()));
+        let downloads = home.join("Downloads");
+        let source = downloads.join("move.txt");
+        let current = home.join("move.txt");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(&source, b"move").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        assert!(current.exists());
+
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::UndoPreview);
+        assert_eq!(app.undo_preview_record().unwrap().current(), current);
+        assert_eq!(app.undo_preview_record().unwrap().source(), source);
+        assert!(app.undo_is_valid());
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert!(source.exists());
+        assert!(!current.exists());
+        assert!(
+            app.notice()
+                .unwrap()
+                .contains("Undo completed successfully")
+        );
+        assert!(app.history_records().last().unwrap().reversed());
+        assert!(app.newest_history_record().is_none());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn blocked_newest_undo_does_not_skip_to_an_older_record() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-undo-blocked-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        let old_source = downloads.join("old.txt");
+        let old_current = home.join("old.txt");
+        let new_source = downloads.join("new.txt");
+        let new_current = home.join("new.txt");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(&old_current, b"old").unwrap();
+        fs::write(&new_current, b"new").unwrap();
+        let mut app = App::new(Vec::new(), home.clone());
+        app.history
+            .record(HistoryAction::Move, old_source.clone(), old_current.clone())
+            .unwrap();
+        app.history
+            .record(
+                HistoryAction::Rename,
+                new_source.clone(),
+                new_current.clone(),
+            )
+            .unwrap();
+        fs::write(&new_source, b"collision").unwrap();
+
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.undo_preview_record().unwrap().current(), new_current);
+        assert!(!app.undo_is_valid());
+        assert!(
+            app.undo_validation_error()
+                .unwrap()
+                .contains("already exists")
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::UndoPreview);
+        assert!(old_current.exists());
+        assert!(new_current.exists());
+        assert!(new_source.exists());
+        assert!(!app.history_records()[0].reversed());
+        assert!(!app.history_records()[1].reversed());
         fs::remove_dir_all(home).unwrap();
     }
 }
