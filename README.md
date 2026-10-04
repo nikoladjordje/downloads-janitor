@@ -67,6 +67,7 @@ Destination.
 | `R` | Refresh Inbox, reload ignored state, and reconcile marks |
 | `i` | Persistently ignore marked entries, or the highlighted entry |
 | `I` | Switch between Inbox and Ignored Entries |
+| `H` | Open History of completed moves and renames |
 | `C` | Open Configuration and manage Favorite Destinations and Rules |
 | `q` | Quit and restore the terminal |
 
@@ -519,7 +520,8 @@ Explicit permanent deletion of a directory does recursively remove its contents.
 
 Milestones 1 through 5 are implemented and verified. Milestone 4 delivers
 efficient manual Inbox processing, Milestone 5 adds reviewable Configuration
-and Rules, and history/undo remains the proposed direction for Milestone 6.
+and Rules, and Milestone 6 begins with persisted History for completed moves
+and renames. Undo and release hardening remain upcoming Milestone 6 work.
 
 ### Milestone 1 — Read-Only Inbox Review
 

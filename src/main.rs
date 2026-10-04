@@ -3,6 +3,7 @@ mod batch;
 mod destination;
 mod favorites;
 mod filename_editor;
+mod history;
 mod ignored_entries;
 mod inbox;
 mod inbox_marks;

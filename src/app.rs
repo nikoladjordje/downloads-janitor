@@ -12,6 +12,7 @@ use crate::{
     destination::{DestinationBrowser, DestinationEntry},
     favorites::{FavoriteDestination, Favorites, Rule, RuleKind},
     filename_editor::FilenameEditor,
+    history::{History, HistoryAction, HistoryRecord},
     ignored_entries::IgnoredEntries,
     inbox::{self, InboxEntry},
     inbox_marks::InboxMarks,
@@ -42,6 +43,7 @@ pub enum Screen {
     RulePatternEditor,
     RuleKindPicker,
     RuleFavoritePicker,
+    History,
 }
 
 pub struct App {
@@ -57,6 +59,8 @@ pub struct App {
     other_entries: Vec<InboxEntry>,
     ignored: IgnoredEntries,
     favorites: Favorites,
+    history: History,
+    unrecorded_history: Vec<(HistoryAction, PathBuf, PathBuf)>,
     viewing_ignored: bool,
     selection: Selection,
     configuration_selection: Selection,
@@ -124,11 +128,13 @@ impl App {
             rule_matches: Vec::new(),
             active_suggestion: None,
             favorites,
+            history: History::load(home.clone()),
+            unrecorded_history: Vec::new(),
             viewing_ignored: false,
             selection,
             marks: InboxMarks::default(),
             screen: Screen::Inbox,
-            destination_browser: DestinationBrowser::new(home),
+            destination_browser: DestinationBrowser::new(home.clone()),
             proposed_move: None,
             source_identity: None,
             rename_editor: None,
@@ -159,6 +165,22 @@ impl App {
 
     pub fn favorites(&self) -> &[FavoriteDestination] {
         self.favorites.entries()
+    }
+
+    pub fn history_records(&self) -> &[HistoryRecord] {
+        self.history.records()
+    }
+
+    pub fn history_warning(&self) -> Option<&str> {
+        self.history.warning()
+    }
+
+    pub fn newest_history_record(&self) -> Option<&HistoryRecord> {
+        self.history.newest_reversible()
+    }
+
+    pub fn unrecorded_history(&self) -> &[(HistoryAction, PathBuf, PathBuf)] {
+        &self.unrecorded_history
     }
 
     pub fn favorite_selected(&self) -> Option<usize> {
@@ -336,6 +358,8 @@ impl App {
                     self.rule_selection = Selection::new(self.favorites.rules().len());
                     self.screen = Screen::Configuration;
                 }
+                KeyCode::Char('H') if self.screen == Screen::Inbox => self.screen = Screen::History,
+                KeyCode::Esc if self.screen == Screen::History => self.screen = Screen::Inbox,
                 KeyCode::Char('R') if self.screen == Screen::Configuration => {
                     self.reload_configuration();
                 }
@@ -699,7 +723,8 @@ impl App {
                             | Screen::FavoriteNameEditor
                             | Screen::RulePatternEditor
                             | Screen::RuleKindPicker
-                            | Screen::RuleFavoritePicker => {}
+                            | Screen::RuleFavoritePicker
+                            | Screen::History => {}
                         }
                         self.pending_g = false;
                     } else {
@@ -1098,9 +1123,42 @@ impl App {
     }
 
     fn advance_batch(&mut self) {
-        let batch = self.batch.as_mut().expect("batch exists");
-        batch.step();
-        if !batch.running {
+        let completed_before = self
+            .batch
+            .as_ref()
+            .expect("batch exists")
+            .entries
+            .iter()
+            .filter(|item| item.outcome == EntryOutcome::Completed)
+            .count();
+        self.batch.as_mut().expect("batch exists").step();
+        let completed_move = self
+            .batch
+            .as_ref()
+            .and_then(|batch| {
+                (batch.action == BatchAction::Move).then(|| {
+                    batch
+                        .entries
+                        .iter()
+                        .filter(|item| item.outcome == EntryOutcome::Completed)
+                        .nth(completed_before)
+                        .and_then(|item| {
+                            item.proposal.as_ref().map(|proposal| {
+                                (
+                                    proposal.source().to_path_buf(),
+                                    proposal.resulting_path().to_path_buf(),
+                                )
+                            })
+                        })
+                })
+            })
+            .flatten();
+        if let Some((source, current)) = completed_move
+            && let Some(notice) = self.record_history(HistoryAction::Move, source, current)
+        {
+            self.notice = Some(notice);
+        }
+        if !self.batch.as_ref().expect("batch exists").running {
             self.finish_batch();
         }
     }
@@ -1559,7 +1617,9 @@ impl App {
             return;
         }
 
+        let source = proposal.source().to_path_buf();
         let result = proposal.resulting_path().to_path_buf();
+        let history_notice = self.record_history(HistoryAction::Rename, source, result.clone());
         let notice = match (self.inbox_scanner)(&self.inbox_path) {
             Ok(entries) => {
                 self.replace_inbox_entries(entries);
@@ -1579,7 +1639,7 @@ impl App {
                 .repair_after_removal(index, self.entries.len());
         }
         self.cancel_rename();
-        self.notice = Some(notice);
+        self.notice = Some(format!("{notice}{}", history_notice.unwrap_or_default()));
         self.marks.clear();
     }
 
@@ -1596,10 +1656,14 @@ impl App {
             return;
         };
         let moved_source = proposal.source().to_path_buf();
+        let resulting_path = proposal.resulting_path().to_path_buf();
         if let Err(error) = move_execution::execute_move(proposal, &self.entries[index], identity) {
             self.move_error = Some(error.to_string());
             return;
         }
+
+        let history_notice =
+            self.record_history(HistoryAction::Move, moved_source.clone(), resulting_path);
 
         let refresh = (self.inbox_scanner)(&self.inbox_path);
         let notice = match refresh {
@@ -1622,7 +1686,7 @@ impl App {
         self.source_identity = None;
         self.active_suggestion = None;
         self.move_error = None;
-        self.notice = Some(notice);
+        self.notice = Some(format!("{notice}{}", history_notice.unwrap_or_default()));
         self.marks.clear();
         self.move_basename = None;
     }
@@ -1636,6 +1700,24 @@ impl App {
             None
         };
         self.move_error = None;
+    }
+
+    fn record_history(
+        &mut self,
+        action: HistoryAction,
+        source: PathBuf,
+        current: PathBuf,
+    ) -> Option<String> {
+        self.history
+            .record(action, source.clone(), current.clone())
+            .err()
+            .map(|error| {
+                self.unrecorded_history.push((action, source, current));
+                format!(
+                    "; {} completed but was not recorded for Undo: {error}",
+                    action.label()
+                )
+            })
     }
 }
 
@@ -1698,7 +1780,7 @@ mod tests {
 
     use crate::proposed_move::{ProposedEntryType, ProposedMove};
 
-    use super::{App, RuleKind, Screen, Selection};
+    use super::{App, HistoryAction, RuleKind, Screen, Selection};
     use crate::rule_match::RuleMatch;
 
     fn app_with_entries(entry_count: usize) -> App {
@@ -4389,5 +4471,92 @@ mod tests {
             app.batch().unwrap().summary(),
             "3 completed, 0 failed, 0 unattempted"
         );
+    }
+
+    #[test]
+    fn completed_moves_and_renames_appear_in_persisted_history() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-history-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(downloads.join("move.txt"), b"move").unwrap();
+        fs::write(downloads.join("rename.txt"), b"rename").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
+        for character in "renamed.txt".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+
+        let reloaded = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+        assert_eq!(reloaded.history_records().len(), 2);
+        assert_eq!(reloaded.history_records()[0].action(), HistoryAction::Move);
+        assert_eq!(
+            reloaded.history_records()[1].action(),
+            HistoryAction::Rename
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn completed_move_reports_when_history_cannot_be_written() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-history-failure-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(downloads.join("move.txt"), b"move").unwrap();
+        fs::create_dir_all(home.join(".local/state/downloads-janitor/history-v1")).unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+
+        assert!(home.join("move.txt").exists());
+        assert!(app.notice().unwrap().contains("not recorded for Undo"));
+        assert_eq!(app.unrecorded_history().len(), 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn completed_bulk_moves_are_recorded_in_execution_order() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-bulk-history-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(downloads.join("b"), b"b").unwrap();
+        fs::write(downloads.join("a"), b"a").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        app.advance_batch();
+        app.advance_batch();
+
+        let reloaded = App::new(Vec::new(), home.clone());
+        assert_eq!(reloaded.history_records().len(), 2);
+        assert_eq!(reloaded.history_records()[0].source(), downloads.join("a"));
+        assert_eq!(reloaded.history_records()[1].source(), downloads.join("b"));
+        fs::remove_dir_all(home).unwrap();
     }
 }

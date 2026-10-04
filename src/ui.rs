@@ -23,6 +23,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::MovePreview | Screen::RenamePreview => render_preview(frame, app),
         Screen::RenameEditor | Screen::MoveNameEditor => render_rename_editor(frame, app),
         Screen::Configuration => render_configuration(frame, app),
+        Screen::History => render_history(frame, app),
         Screen::FavoriteNameEditor => render_favorite_name_editor(frame, app),
         Screen::RulePatternEditor => render_rule_pattern_editor(frame, app),
         Screen::RuleKindPicker => render_rule_kind_picker(frame, app),
@@ -344,11 +345,71 @@ fn render_inbox(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(if app.viewing_ignored() {
             "j/k ↑/↓ Navigate  gg Top  G Bottom  u Restore  I Inbox  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\nR Refresh"
         } else {
-            "j/k ↑/↓ Navigate  gg Top  G Bottom  Enter Choose  r Rename  t Trash  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\ni Ignore  I Ignored entries  C Configuration  R Refresh  D Delete permanently"
+            "j/k ↑/↓ Navigate  gg Top  G Bottom  Enter Choose  r Rename  t Trash  q Quit\nSpace Mark  V Visual  a All  c Clear  Esc Clear\ni Ignore  I Ignored entries  H History  C Configuration  R Refresh  D Delete permanently"
         })
         .alignment(Alignment::Right)
         .block(Block::default().borders(Borders::ALL)),
         areas[2],
+    );
+}
+
+fn render_history(frame: &mut Frame<'_>, app: &App) {
+    let mut lines = Vec::new();
+    if let Some(warning) = app.history_warning() {
+        lines.push(Line::from(Span::styled(
+            warning,
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(
+            "Completed actions remain safe, but cannot be recorded for application Undo.",
+        ));
+    } else if app.history_records().is_empty() {
+        lines.push(Line::from(
+            "No completed moves or renames have been recorded.",
+        ));
+    } else {
+        for record in app.history_records().iter().rev() {
+            let newest = app
+                .newest_history_record()
+                .is_some_and(|candidate| candidate == record);
+            lines.push(Line::from(format!(
+                "{} {} — {}{}",
+                record.action().label(),
+                if newest { "(newest)" } else { "" },
+                if record.reversible() {
+                    "reversible"
+                } else {
+                    "not undoable"
+                },
+                if newest {
+                    "; newest reversible record"
+                } else {
+                    ""
+                },
+            )));
+            lines.push(Line::from(format!("From: {:?}", record.source())));
+            lines.push(Line::from(format!("Now:  {:?}", record.current())));
+            lines.push(Line::default());
+        }
+    }
+    for (action, source, current) in app.unrecorded_history() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} completed but is not undoable through Downloads Janitor",
+                action.label()
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(format!("From: {:?}", source)));
+        lines.push(Line::from(format!("Now:  {:?}", current)));
+        lines.push(Line::default());
+    }
+    lines.push(Line::from("Esc Inbox    q Quit"));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::bordered().title("History")),
+        frame.area(),
     );
 }
 
