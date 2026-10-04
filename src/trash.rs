@@ -86,7 +86,7 @@ impl TrashReview {
         Ok(())
     }
 
-    pub fn execute(&self, root: &Path) -> Result<(), String> {
+    pub fn execute(&self, root: &Path) -> Result<PathBuf, String> {
         self.validate()?;
         // Canonicalize only the parent: a Symlink Entry is always the link itself.
         let source = fs::canonicalize(self.source.parent().ok_or("Source has no parent")?)
@@ -140,10 +140,12 @@ impl TrashReview {
                 {
                     return Err("Source identity changed after review".into());
                 }
-                rename_noreplace(&source, &target).map_err(|e| e.to_string())
+                rename_noreplace(&source, &target)
+                    .map(|()| target)
+                    .map_err(|e| e.to_string())
             })();
             return match result {
-                Ok(()) => Ok(()),
+                Ok(payload) => Ok(payload),
                 Err(error) => Err(cleanup_failure(error, &metadata_path, |path| {
                     fs::remove_file(path)
                 })),

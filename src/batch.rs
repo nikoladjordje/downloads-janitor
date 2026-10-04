@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{
+    history::HistoryAction,
     inbox::InboxEntry,
     move_execution::{self, SourceIdentity},
     proposed_move::ProposedMove,
@@ -13,8 +14,21 @@ use crate::{
 #[derive(Debug, Eq, PartialEq)]
 pub enum EntryOutcome {
     Unattempted,
-    Completed,
+    Completed(CompletedAction),
     Failed(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum CompletedAction {
+    Move,
+    Trash { payload: PathBuf },
+    Delete,
+}
+
+impl EntryOutcome {
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed(_))
+    }
 }
 
 pub struct BatchEntry {
@@ -168,36 +182,35 @@ impl Batch {
             return;
         };
         let result = match &self.action {
-            BatchAction::Trash(root) => {
-                crate::trash::TrashReview::new(&item.entry).and_then(|review| review.execute(root))
-            }
+            BatchAction::Trash(root) => crate::trash::TrashReview::new(&item.entry)
+                .and_then(|review| review.execute(root))
+                .map(|payload| CompletedAction::Trash { payload }),
             BatchAction::Delete => crate::permanent_delete::DeleteReview::new(&item.entry)
-                .and_then(|review| review.execute()),
+                .and_then(|review| review.execute())
+                .map(|()| CompletedAction::Delete),
             BatchAction::Move => {
                 let proposal = item.proposal.as_ref().expect("move has proposal");
-                validate_destination(&self.home, proposal.destination()).and_then(|()| {
-                    move_execution::execute_move(
-                        proposal,
-                        &item.entry,
-                        item.entry.identity().expect("preflight checked identity"),
-                    )
-                    .map_err(|error| error.to_string())
-                })
+                validate_destination(&self.home, proposal.destination())
+                    .and_then(|()| {
+                        move_execution::execute_move(
+                            proposal,
+                            &item.entry,
+                            item.entry.identity().expect("preflight checked identity"),
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                    .map(|()| CompletedAction::Move)
             }
         };
         match result {
-            Ok(()) => item.outcome = EntryOutcome::Completed,
+            Ok(action) => item.outcome = EntryOutcome::Completed(action),
             Err(error) => {
                 item.outcome = EntryOutcome::Failed(error);
                 self.finish();
                 return;
             }
         }
-        if self
-            .entries
-            .iter()
-            .all(|item| item.outcome == EntryOutcome::Completed)
-        {
+        if self.entries.iter().all(|item| item.outcome.is_completed()) {
             self.finish();
         }
     }
@@ -218,7 +231,7 @@ impl Batch {
         let completed = self
             .entries
             .iter()
-            .filter(|item| item.outcome == EntryOutcome::Completed)
+            .filter(|item| item.outcome.is_completed())
             .count();
         let failed = self
             .entries
@@ -230,6 +243,36 @@ impl Batch {
             self.entries.len() - completed - failed,
             if self.stopped { " — stopped" } else { "" }
         )
+    }
+
+    pub fn completed_history_after(
+        &self,
+        completed_before: usize,
+    ) -> Option<(HistoryAction, PathBuf, PathBuf)> {
+        let item = self
+            .entries
+            .iter()
+            .filter(|item| item.outcome.is_completed())
+            .nth(completed_before)?;
+        match &item.outcome {
+            EntryOutcome::Completed(CompletedAction::Move) => {
+                item.proposal.as_ref().map(|proposal| {
+                    (
+                        HistoryAction::Move,
+                        proposal.source().to_path_buf(),
+                        proposal.resulting_path().to_path_buf(),
+                    )
+                })
+            }
+            EntryOutcome::Completed(CompletedAction::Trash { payload }) => Some((
+                HistoryAction::Trash,
+                item.entry.path().to_path_buf(),
+                payload.clone(),
+            )),
+            EntryOutcome::Completed(CompletedAction::Delete)
+            | EntryOutcome::Unattempted
+            | EntryOutcome::Failed(_) => None,
+        }
     }
 }
 

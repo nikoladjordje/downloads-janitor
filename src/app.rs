@@ -8,7 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 
 use crate::{
     Result,
-    batch::{Batch, BatchAction, EntryOutcome},
+    batch::{Batch, BatchAction},
     destination::{DestinationBrowser, DestinationEntry},
     favorites::{FavoriteDestination, Favorites, Rule, RuleKind},
     filename_editor::FilenameEditor,
@@ -1129,32 +1129,15 @@ impl App {
             .expect("batch exists")
             .entries
             .iter()
-            .filter(|item| item.outcome == EntryOutcome::Completed)
+            .filter(|item| item.outcome.is_completed())
             .count();
         self.batch.as_mut().expect("batch exists").step();
-        let completed_move = self
+        let completed_history = self
             .batch
             .as_ref()
-            .and_then(|batch| {
-                (batch.action == BatchAction::Move).then(|| {
-                    batch
-                        .entries
-                        .iter()
-                        .filter(|item| item.outcome == EntryOutcome::Completed)
-                        .nth(completed_before)
-                        .and_then(|item| {
-                            item.proposal.as_ref().map(|proposal| {
-                                (
-                                    proposal.source().to_path_buf(),
-                                    proposal.resulting_path().to_path_buf(),
-                                )
-                            })
-                        })
-                })
-            })
-            .flatten();
-        if let Some((source, current)) = completed_move
-            && let Some(notice) = self.record_history(HistoryAction::Move, source, current)
+            .and_then(|batch| batch.completed_history_after(completed_before));
+        if let Some((action, source, current)) = completed_history
+            && let Some(notice) = self.record_history(action, source, current)
         {
             self.notice = Some(notice);
         }
@@ -1172,8 +1155,7 @@ impl App {
             let current_identity = std::fs::symlink_metadata(item.entry.path())
                 .ok()
                 .map(|metadata| SourceIdentity::from_metadata(&metadata));
-            if item.outcome == EntryOutcome::Completed || current_identity != item.entry.identity()
-            {
+            if item.outcome.is_completed() || current_identity != item.entry.identity() {
                 self.marks.remove(&item.entry);
             }
         }
@@ -1182,7 +1164,7 @@ impl App {
             Err(error) => {
                 self.entries.retain(|entry| {
                     !batch.entries.iter().any(|item| {
-                        item.outcome == EntryOutcome::Completed
+                        item.outcome.is_completed()
                             && item.entry.path() == entry.path()
                             && item.entry.identity() == entry.identity()
                     })
@@ -1576,11 +1558,15 @@ impl App {
             .trash_review
             .as_ref()
             .expect("Trash preview has a review");
-        if let Err(error) = review.execute(&self.trash_root) {
-            self.move_error = Some(format!("Trash failed: {error}"));
-            return;
-        }
+        let payload = match review.execute(&self.trash_root) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.move_error = Some(format!("Trash failed: {error}"));
+                return;
+            }
+        };
         let source = review.source.clone();
+        let history_notice = self.record_history(HistoryAction::Trash, source.clone(), payload);
         let index = self.selected().unwrap_or(0);
         let notice = match (self.inbox_scanner)(&self.inbox_path) {
             Ok(entries) => {
@@ -1600,7 +1586,7 @@ impl App {
         self.trash_review = None;
         self.move_error = None;
         self.screen = Screen::Inbox;
-        self.notice = Some(notice);
+        self.notice = Some(format!("{notice}{}", history_notice.unwrap_or_default()));
     }
 
     fn attempt_rename(&mut self) {
@@ -3257,6 +3243,14 @@ mod tests {
                 app.batch().unwrap().summary(),
                 "1 completed, 1 failed, 1 unattempted"
             );
+            if !delete {
+                let reloaded = App::new(Vec::new(), fixture.0.clone());
+                assert_eq!(reloaded.history_records().len(), 1);
+                let record = &reloaded.history_records()[0];
+                assert_eq!(record.action(), HistoryAction::Trash);
+                assert_eq!(record.source(), fixture.path("a"));
+                assert!(record.current().starts_with(app.trash_root.join("files")));
+            }
             assert!(fixture.path("b").exists());
             assert_eq!(fixture.path("b/child").exists(), !delete);
             assert!(fixture.path("c").exists());
@@ -4507,6 +4501,32 @@ mod tests {
             reloaded.history_records()[1].action(),
             HistoryAction::Rename
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn completed_trash_is_recorded_with_its_payload_path_after_restart() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-trash-history-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        let source = downloads.join("keep.txt");
+        fs::write(&source, b"keep").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+        app.trash_root = home.join("Trash");
+
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Enter);
+
+        let reloaded = App::new(Vec::new(), home.clone());
+        let record = reloaded.history_records().last().unwrap();
+        assert_eq!(record.action(), HistoryAction::Trash);
+        assert_eq!(record.source(), source);
+        assert!(record.current().starts_with(home.join("Trash/files")));
+        assert_eq!(fs::read(record.current()).unwrap(), b"keep");
         fs::remove_dir_all(home).unwrap();
     }
 

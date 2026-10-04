@@ -111,7 +111,7 @@ pub(crate) fn batch_lines(app: &App) -> Vec<String> {
     let mut lines = Vec::new();
     for (index, item) in batch.entries.iter().enumerate() {
         let status = match &item.outcome {
-            crate::batch::EntryOutcome::Completed => "Completed".to_owned(),
+            crate::batch::EntryOutcome::Completed(_) => "Completed".to_owned(),
             crate::batch::EntryOutcome::Failed(error) => format!("Failed: {error}"),
             crate::batch::EntryOutcome::Unattempted => if app.screen() == Screen::BulkPreview {
                 if item.problems.is_empty() {
@@ -225,7 +225,7 @@ fn render_batch(frame: &mut Frame<'_>, app: &App) {
         batch
             .entries
             .iter()
-            .take_while(|item| item.outcome == crate::batch::EntryOutcome::Completed)
+            .take_while(|item| item.outcome.is_completed())
             .count()
             * 4
     } else {
@@ -365,7 +365,7 @@ fn render_history(frame: &mut Frame<'_>, app: &App) {
         ));
     } else if app.history_records().is_empty() {
         lines.push(Line::from(
-            "No completed moves or renames have been recorded.",
+            "No completed moves, renames, or Trash actions have been recorded.",
         ));
     } else {
         for record in app.history_records().iter().rev() {

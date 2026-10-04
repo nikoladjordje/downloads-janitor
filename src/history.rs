@@ -21,18 +21,21 @@ static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(0);
 pub enum HistoryAction {
     Move,
     Rename,
+    Trash,
 }
 impl HistoryAction {
     fn encoded(self) -> &'static str {
         match self {
             Self::Move => "move",
             Self::Rename => "rename",
+            Self::Trash => "trash",
         }
     }
     fn decode(value: &str) -> Option<Self> {
         match value {
             "move" => Some(Self::Move),
             "rename" => Some(Self::Rename),
+            "trash" => Some(Self::Trash),
             _ => None,
         }
     }
@@ -40,6 +43,7 @@ impl HistoryAction {
         match self {
             Self::Move => "Move",
             Self::Rename => "Rename",
+            Self::Trash => "Trash",
         }
     }
 }
