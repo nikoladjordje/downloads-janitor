@@ -35,6 +35,10 @@ impl DeleteReview {
         crate::batch::check_removal_parent(&self.source)
     }
 
+    pub fn identity(&self) -> SourceIdentity {
+        self.identity
+    }
+
     pub fn execute(&self) -> Result<(), String> {
         let metadata = self.validate()?;
         if metadata.is_dir() {

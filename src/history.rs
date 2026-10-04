@@ -22,6 +22,7 @@ pub enum HistoryAction {
     Move,
     Rename,
     Trash,
+    Delete,
 }
 impl HistoryAction {
     fn encoded(self) -> &'static str {
@@ -29,6 +30,7 @@ impl HistoryAction {
             Self::Move => "move",
             Self::Rename => "rename",
             Self::Trash => "trash",
+            Self::Delete => "delete",
         }
     }
     fn decode(value: &str) -> Option<Self> {
@@ -36,6 +38,7 @@ impl HistoryAction {
             "move" => Some(Self::Move),
             "rename" => Some(Self::Rename),
             "trash" => Some(Self::Trash),
+            "delete" => Some(Self::Delete),
             _ => None,
         }
     }
@@ -44,6 +47,7 @@ impl HistoryAction {
             Self::Move => "Move",
             Self::Rename => "Rename",
             Self::Trash => "Trash",
+            Self::Delete => "Permanent deletion",
         }
     }
 }
@@ -68,7 +72,7 @@ impl HistoryRecord {
         &self.current
     }
     pub fn reversible(&self) -> bool {
-        true
+        self.action != HistoryAction::Delete
     }
 }
 
@@ -100,7 +104,7 @@ impl History {
         self.warning.as_deref()
     }
     pub fn newest_reversible(&self) -> Option<&HistoryRecord> {
-        self.records.last()
+        self.records.iter().rfind(|record| record.reversible())
     }
     pub fn record(
         &mut self,
@@ -112,6 +116,21 @@ impl History {
             return Err(io::Error::other(warning.clone()));
         }
         let identity = SourceIdentity::from_metadata(&fs::symlink_metadata(&current)?);
+        self.record_with_identity(action, source, current, identity)
+    }
+    pub fn record_deletion(&mut self, source: PathBuf, identity: SourceIdentity) -> io::Result<()> {
+        self.record_with_identity(HistoryAction::Delete, source.clone(), source, identity)
+    }
+    fn record_with_identity(
+        &mut self,
+        action: HistoryAction,
+        source: PathBuf,
+        current: PathBuf,
+        identity: SourceIdentity,
+    ) -> io::Result<()> {
+        if let Some(warning) = &self.warning {
+            return Err(io::Error::other(warning.clone()));
+        }
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(io::Error::other)?

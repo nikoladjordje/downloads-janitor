@@ -67,7 +67,7 @@ Destination.
 | `R` | Refresh Inbox, reload ignored state, and reconcile marks |
 | `i` | Persistently ignore marked entries, or the highlighted entry |
 | `I` | Switch between Inbox and Ignored Entries |
-| `H` | Open History of completed moves and renames |
+| `H` | Open History of completed actions, including irreversible permanent deletions |
 | `C` | Open Configuration and manage Favorite Destinations and Rules |
 | `q` | Quit and restore the terminal |
 

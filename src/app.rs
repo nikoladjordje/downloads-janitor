@@ -1136,8 +1136,17 @@ impl App {
             .batch
             .as_ref()
             .and_then(|batch| batch.completed_history_after(completed_before));
-        if let Some((action, source, current)) = completed_history
-            && let Some(notice) = self.record_history(action, source, current)
+        if let Some(completed_history) = completed_history
+            && let Some(notice) = match completed_history {
+                crate::batch::CompletedHistory::Reversible {
+                    action,
+                    source,
+                    current,
+                } => self.record_history(action, source, current),
+                crate::batch::CompletedHistory::Deletion { source, identity } => {
+                    self.record_deletion_history(source, identity)
+                }
+            }
         {
             self.notice = Some(notice);
         }
@@ -1531,6 +1540,7 @@ impl App {
             return;
         }
         let source = review.source.clone();
+        let history_notice = self.record_deletion_history(source.clone(), review.identity());
         let index = self.selected().unwrap_or(0);
         let notice = match (self.inbox_scanner)(&self.inbox_path) {
             Ok(entries) => {
@@ -1550,7 +1560,7 @@ impl App {
         self.delete_review = None;
         self.move_error = None;
         self.screen = Screen::Inbox;
-        self.notice = Some(notice);
+        self.notice = Some(format!("{notice}{}", history_notice.unwrap_or_default()));
     }
 
     fn attempt_trash(&mut self) {
@@ -1704,6 +1714,20 @@ impl App {
                     action.label()
                 )
             })
+    }
+
+    fn record_deletion_history(
+        &mut self,
+        source: PathBuf,
+        identity: SourceIdentity,
+    ) -> Option<String> {
+        self.history.record_deletion(source.clone(), identity).err().map(|error| {
+            self.unrecorded_history
+                .push((HistoryAction::Delete, source.clone(), source));
+            format!(
+                "; Permanent deletion completed but was not recorded for the audit trail: {error}"
+            )
+        })
     }
 }
 
@@ -2894,6 +2918,12 @@ mod tests {
             );
             assert_eq!(app.notice().unwrap().contains("refresh failed"), failure);
             assert!(!app.trash_root.exists());
+            let reloaded = App::new(Vec::new(), fixture.0.clone());
+            let record = reloaded.history_records().last().unwrap();
+            assert_eq!(record.action(), HistoryAction::Delete);
+            assert_eq!(record.source(), fixture.path("b"));
+            assert!(!record.reversible());
+            assert!(reloaded.newest_history_record().is_none());
         }
     }
 
@@ -3113,6 +3143,14 @@ mod tests {
                         app.notice().unwrap().contains("refresh failed"),
                         refresh_failure
                     );
+                    if delete && completed == 1 {
+                        let reloaded = App::new(Vec::new(), fixture.0.clone());
+                        assert_eq!(reloaded.history_records().len(), 1);
+                        let record = &reloaded.history_records()[0];
+                        assert_eq!(record.action(), HistoryAction::Delete);
+                        assert!(!record.reversible());
+                        assert!(reloaded.newest_history_record().is_none());
+                    }
                 }
             }
         }

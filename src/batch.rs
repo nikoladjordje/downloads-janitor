@@ -25,6 +25,18 @@ pub enum CompletedAction {
     Delete,
 }
 
+pub enum CompletedHistory {
+    Reversible {
+        action: HistoryAction,
+        source: PathBuf,
+        current: PathBuf,
+    },
+    Deletion {
+        source: PathBuf,
+        identity: SourceIdentity,
+    },
+}
+
 impl EntryOutcome {
     pub fn is_completed(&self) -> bool {
         matches!(self, Self::Completed(_))
@@ -245,10 +257,7 @@ impl Batch {
         )
     }
 
-    pub fn completed_history_after(
-        &self,
-        completed_before: usize,
-    ) -> Option<(HistoryAction, PathBuf, PathBuf)> {
+    pub fn completed_history_after(&self, completed_before: usize) -> Option<CompletedHistory> {
         let item = self
             .entries
             .iter()
@@ -256,22 +265,31 @@ impl Batch {
             .nth(completed_before)?;
         match &item.outcome {
             EntryOutcome::Completed(CompletedAction::Move) => {
-                item.proposal.as_ref().map(|proposal| {
-                    (
-                        HistoryAction::Move,
-                        proposal.source().to_path_buf(),
-                        proposal.resulting_path().to_path_buf(),
-                    )
+                item.proposal
+                    .as_ref()
+                    .map(|proposal| CompletedHistory::Reversible {
+                        action: HistoryAction::Move,
+                        source: proposal.source().to_path_buf(),
+                        current: proposal.resulting_path().to_path_buf(),
+                    })
+            }
+            EntryOutcome::Completed(CompletedAction::Trash { payload }) => {
+                Some(CompletedHistory::Reversible {
+                    action: HistoryAction::Trash,
+                    source: item.entry.path().to_path_buf(),
+                    current: payload.clone(),
                 })
             }
-            EntryOutcome::Completed(CompletedAction::Trash { payload }) => Some((
-                HistoryAction::Trash,
-                item.entry.path().to_path_buf(),
-                payload.clone(),
-            )),
-            EntryOutcome::Completed(CompletedAction::Delete)
-            | EntryOutcome::Unattempted
-            | EntryOutcome::Failed(_) => None,
+            EntryOutcome::Completed(CompletedAction::Delete) => {
+                item.entry
+                    .identity()
+                    .map(|identity| CompletedHistory::Deletion {
+                        source: item.entry.path().to_path_buf(),
+                        identity,
+                    })
+            }
+
+            EntryOutcome::Unattempted | EntryOutcome::Failed(_) => None,
         }
     }
 }

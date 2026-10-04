@@ -388,7 +388,11 @@ fn render_history(frame: &mut Frame<'_>, app: &App) {
                 },
             )));
             lines.push(Line::from(format!("From: {:?}", record.source())));
-            lines.push(Line::from(format!("Now:  {:?}", record.current())));
+            if record.action() == crate::history::HistoryAction::Delete {
+                lines.push(Line::from("Deleted permanently; recovery is unavailable."));
+            } else {
+                lines.push(Line::from(format!("Now:  {:?}", record.current())));
+            }
             lines.push(Line::default());
         }
     }
@@ -861,6 +865,32 @@ mod tests {
         assert!(source.exists());
         press(&mut app, KeyCode::Esc);
         assert!(source.exists());
+    }
+
+    #[test]
+    fn history_renders_permanent_deletions_as_irreversible() {
+        let fixture = TestDirectory::new();
+        let downloads = fixture.0.join("Downloads");
+        let source = downloads.join("gone.txt");
+        fs::create_dir(&downloads).unwrap();
+        fs::write(&source, b"gone").unwrap();
+        let mut app = App::new(
+            crate::inbox::scan_inbox(&downloads).unwrap(),
+            fixture.0.clone(),
+        );
+
+        press(&mut app, KeyCode::Char('D'));
+        for character in "delete".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('H'));
+
+        let output = rendered(&app, 120, 14);
+        assert!(output.contains("Permanent deletion"));
+        assert!(output.contains("not undoable"));
+        assert!(output.contains("Deleted permanently; recovery is unavailable."));
+        assert!(!output.contains("newest reversible record"));
     }
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
