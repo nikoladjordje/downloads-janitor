@@ -44,19 +44,22 @@ pub enum Screen {
     RuleKindPicker,
     RuleFavoritePicker,
     History,
+    HistoryClearConfirmation,
     UndoPreview,
 }
 
 #[derive(Clone)]
 struct UndoPreview {
     record: HistoryRecord,
+    latest_record: Option<HistoryRecord>,
     validation_error: Option<String>,
 }
 impl UndoPreview {
-    fn new(record: HistoryRecord) -> Self {
+    fn new(record: HistoryRecord, latest_record: Option<HistoryRecord>) -> Self {
         let validation_error = Self::validation_error(&record);
         Self {
             record,
+            latest_record,
             validation_error,
         }
     }
@@ -87,6 +90,7 @@ pub struct App {
     ignored: IgnoredEntries,
     favorites: Favorites,
     history: History,
+    pub(crate) history_clear_confirmation: String,
     undo_preview: Option<UndoPreview>,
     unrecorded_history: Vec<(HistoryAction, PathBuf, PathBuf)>,
     viewing_ignored: bool,
@@ -157,6 +161,7 @@ impl App {
             active_suggestion: None,
             favorites,
             history: History::load(home.clone()),
+            history_clear_confirmation: String::new(),
             undo_preview: None,
             unrecorded_history: Vec::new(),
             viewing_ignored: false,
@@ -375,6 +380,10 @@ impl App {
                 self.handle_delete_key(key);
                 return;
             }
+            if self.screen == Screen::HistoryClearConfirmation {
+                self.handle_history_clear_key(key);
+                return;
+            }
             self.notice = None;
             if matches!(self.screen, Screen::RenameEditor | Screen::MoveNameEditor) {
                 self.handle_rename_editor(key);
@@ -399,9 +408,22 @@ impl App {
                     self.rule_selection = Selection::new(self.favorites.rules().len());
                     self.screen = Screen::Configuration;
                 }
-                KeyCode::Char('H') if self.screen == Screen::Inbox => self.screen = Screen::History,
+                KeyCode::Char('H') if self.screen == Screen::Inbox => {
+                    let _ = self.history.refresh();
+                    self.screen = Screen::History;
+                }
                 KeyCode::Esc if self.screen == Screen::History => self.screen = Screen::Inbox,
                 KeyCode::Enter if self.screen == Screen::History => self.start_undo_preview(),
+                KeyCode::Char('c') if self.screen == Screen::History => {
+                    if self.history.warning().is_some() {
+                        self.notice = Some(
+                            "History cannot be cleared until its original file is repaired".into(),
+                        );
+                    } else {
+                        self.history_clear_confirmation.clear();
+                        self.screen = Screen::HistoryClearConfirmation;
+                    }
+                }
                 KeyCode::Esc if self.screen == Screen::UndoPreview => {
                     self.undo_preview = None;
                     self.screen = Screen::History;
@@ -772,6 +794,7 @@ impl App {
                             | Screen::RuleKindPicker
                             | Screen::RuleFavoritePicker
                             | Screen::History
+                            | Screen::HistoryClearConfirmation
                             | Screen::UndoPreview => {}
                         }
                         self.pending_g = false;
@@ -1765,6 +1788,11 @@ impl App {
     }
 
     fn start_undo_preview(&mut self) {
+        if self.history.refresh().is_err() {
+            self.notice =
+                Some("History is unavailable; repair its original file before Undo".into());
+            return;
+        }
         let Some(record) = self.history.newest_reversible().cloned() else {
             self.notice = Some("No reversible History record is available".into());
             return;
@@ -1776,32 +1804,51 @@ impl App {
             ));
             return;
         }
-        self.undo_preview = Some(UndoPreview::new(record));
+        self.undo_preview = Some(UndoPreview::new(
+            record,
+            self.history.records().last().cloned(),
+        ));
         self.screen = Screen::UndoPreview;
     }
 
+    fn handle_history_clear_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.screen = Screen::History,
+            KeyCode::Backspace => {
+                self.history_clear_confirmation.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.history_clear_confirmation.clear();
+            }
+            KeyCode::Enter if self.history_clear_confirmation == "clear history" => {
+                match self.history.clear() {
+                    Ok(()) => {
+                        self.history_clear_confirmation.clear();
+                        self.notice = Some("History cleared".into());
+                        self.screen = Screen::History;
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!("History was not cleared: {error}"));
+                        self.screen = Screen::History;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                self.notice = Some("Type exactly clear history before pressing Enter".into());
+            }
+            KeyCode::Char(character) => self.history_clear_confirmation.push(character),
+            _ => {}
+        }
+    }
+
     fn attempt_undo(&mut self) {
-        let Some(reviewed) = self
+        let Some((reviewed, latest_record)) = self
             .undo_preview
             .as_ref()
-            .map(|preview| preview.record.clone())
+            .map(|preview| (preview.record.clone(), preview.latest_record.clone()))
         else {
             return;
         };
-        if self.history.refresh().is_err()
-            || self
-                .history
-                .newest_reversible()
-                .is_none_or(|record| record.id() != reviewed.id())
-        {
-            self.undo_preview
-                .as_mut()
-                .expect("Undo preview exists")
-                .validation_error = Some(
-                "History changed since this Undo Preview; review the newest record again".into(),
-            );
-            return;
-        }
         self.undo_preview
             .as_mut()
             .expect("Undo preview exists")
@@ -1809,28 +1856,47 @@ impl App {
         if !self.undo_is_valid() {
             return;
         }
-        if let Err(error) = crate::undo::execute(&reviewed) {
-            self.undo_preview
-                .as_mut()
-                .expect("Undo preview exists")
-                .validation_error = Some(error.to_string());
-            return;
-        }
-        if let Err(error) = self.history.mark_reversed(reviewed.id()) {
-            let rollback = move_execution::rename_noreplace(reviewed.source(), reviewed.current());
-            let message = match rollback {
-                Ok(()) => format!(
-                    "Undo was not completed because History could not mark it reversed; the filesystem was restored: {error}"
-                ),
-                Err(rollback_error) => format!(
-                    "Undo moved the entry but History could not mark it reversed, and restoring the filesystem failed: {error}; {rollback_error}"
-                ),
-            };
-            self.undo_preview
-                .as_mut()
-                .expect("Undo preview exists")
-                .validation_error = Some(message);
-            return;
+        match self
+            .history
+            .execute_undo(reviewed.id(), latest_record.as_ref(), || {
+                crate::undo::execute(&reviewed).map_err(|error| io::Error::other(error.to_string()))
+            }) {
+            Ok(()) => {}
+            Err(crate::history::UndoCommitError::Changed) => {
+                self.undo_preview
+                    .as_mut()
+                    .expect("Undo preview exists")
+                    .validation_error = Some(
+                    "History changed since this Undo Preview; review the newest record again"
+                        .into(),
+                );
+                return;
+            }
+            Err(crate::history::UndoCommitError::Operation(error))
+            | Err(crate::history::UndoCommitError::Unavailable(error)) => {
+                self.undo_preview
+                    .as_mut()
+                    .expect("Undo preview exists")
+                    .validation_error = Some(error.to_string());
+                return;
+            }
+            Err(crate::history::UndoCommitError::Persist(error)) => {
+                let rollback =
+                    move_execution::rename_noreplace(reviewed.source(), reviewed.current());
+                let message = match rollback {
+                    Ok(()) => format!(
+                        "Undo was not completed because History could not mark it reversed; the filesystem was restored: {error}"
+                    ),
+                    Err(rollback_error) => format!(
+                        "Undo moved the entry but History could not mark it reversed, and restoring the filesystem failed: {error}; {rollback_error}"
+                    ),
+                };
+                self.undo_preview
+                    .as_mut()
+                    .expect("Undo preview exists")
+                    .validation_error = Some(message);
+                return;
+            }
         }
         let notice = match (self.inbox_scanner)(&self.inbox_path) {
             Ok(entries) => {
@@ -4901,6 +4967,110 @@ mod tests {
         assert!(new_source.exists());
         assert!(!app.history_records()[0].reversed());
         assert!(!app.history_records()[1].reversed());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn history_clear_requires_typed_confirmation_and_preserves_manual_inbox_work() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-history-clear-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(downloads.join("move.txt"), b"move").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.screen(), Screen::HistoryClearConfirmation);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.history_records().len(), 1);
+        for character in "clear history".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.screen(), Screen::History);
+        assert!(app.history_records().is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert!(home.join("move.txt").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn changed_newest_history_record_invalidates_an_open_undo_preview() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-history-concurrent-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        let source = downloads.join("source");
+        let current = home.join("current");
+        let newer_current = home.join("newer-current");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(&current, b"current").unwrap();
+        fs::write(&newer_current, b"newer").unwrap();
+        let mut app = App::new(Vec::new(), home.clone());
+        app.history
+            .record(HistoryAction::Move, source, current.clone())
+            .unwrap();
+
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::UndoPreview);
+        crate::history::History::load(home.clone())
+            .record(
+                HistoryAction::Delete,
+                downloads.join("newer-source"),
+                newer_current.clone(),
+            )
+            .unwrap();
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            app.undo_validation_error()
+                .unwrap()
+                .contains("History changed")
+        );
+        assert!(current.exists());
+        assert!(newer_current.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn malformed_external_history_disables_undo_without_disabling_manual_inbox_actions() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-history-corrupt-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        let entry = downloads.join("entry");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(&entry, b"entry").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+        fs::create_dir_all(home.join(".local/state/downloads-janitor")).unwrap();
+        fs::write(
+            home.join(".local/state/downloads-janitor/history-v1"),
+            b"not valid history\n",
+        )
+        .unwrap();
+
+        press(&mut app, KeyCode::Char('H'));
+        assert!(app.history_warning().is_some());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::History);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.screen(), Screen::RenameEditor);
+        assert!(entry.exists());
         fs::remove_dir_all(home).unwrap();
     }
 }

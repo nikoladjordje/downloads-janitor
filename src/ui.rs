@@ -24,6 +24,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::RenameEditor | Screen::MoveNameEditor => render_rename_editor(frame, app),
         Screen::Configuration => render_configuration(frame, app),
         Screen::History => render_history(frame, app),
+        Screen::HistoryClearConfirmation => render_history_clear_confirmation(frame, app),
         Screen::UndoPreview => render_undo_preview(frame, app),
         Screen::FavoriteNameEditor => render_favorite_name_editor(frame, app),
         Screen::RulePatternEditor => render_rule_pattern_editor(frame, app),
@@ -412,12 +413,24 @@ fn render_history(frame: &mut Frame<'_>, app: &App) {
         lines.push(Line::default());
     }
     lines.push(Line::from(
-        "Enter Undo newest reversible action    Esc Inbox    q Quit",
+        "Enter Undo newest reversible action    c Clear history    Esc Inbox    q Quit",
     ));
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(ratatui::widgets::Wrap { trim: false })
             .block(Block::bordered().title("History")),
+        frame.area(),
+    );
+}
+
+fn render_history_clear_confirmation(frame: &mut Frame<'_>, app: &App) {
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Clear every audit and reversal record. This cannot be undone.\n\nType exactly clear history, then Enter: {:?}\nEsc Cancel; Backspace Edit; Ctrl+u Clear",
+            app.history_clear_confirmation
+        ))
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(Block::bordered().title("Clear History Confirmation")),
         frame.area(),
     );
 }

@@ -325,6 +325,20 @@ restores it only when the payload still has its recorded identity and the origin
 path's parent is an available directory with no entry at that path. Restoration
 never overwrites, auto-renames, merges, or offers a different Destination.
 
+## History and Undo safety
+
+Open History with `H`. It records completed moves, renames, Trash operations,
+and permanent deletions; only the newest reversible record may be reviewed with
+`Enter`. Press `c` from History and type exactly `clear history` before pressing
+Enter to remove every audit and reversal record. Clearing is irreversible.
+
+History is stored at `$HOME/.local/state/downloads-janitor/history-v1`. Updates
+take an exclusive companion lock so concurrent Downloads Janitor instances do
+not overwrite each other's records. History is reloaded before viewing or
+starting Undo, and a newer record invalidates an already open Undo Preview.
+Malformed or externally changed History is preserved and disables History/Undo;
+manual Inbox actions remain available until the original file is repaired.
+
 Storage follows the [freedesktop Trash specification](https://specifications.freedesktop.org/trash/latest/):
 `$XDG_DATA_HOME/Trash`, defaulting to `$HOME/.local/share/Trash` when the override
 is absent, empty, or relative. The `files` payload has matching `.trashinfo`
@@ -524,8 +538,8 @@ Explicit permanent deletion of a directory does recursively remove its contents.
 Milestones 1 through 5 are implemented and verified. Milestone 4 delivers
 efficient manual Inbox processing, Milestone 5 adds reviewable Configuration
 and Rules, and Milestone 6 adds persisted History plus reviewed undo for moves,
-renames, and Trash restoration. Further recovery controls and release hardening
-remain upcoming Milestone 6 work.
+renames, and Trash restoration, explicit History clearing, and concurrent
+History-update protection. Release hardening remains upcoming Milestone 6 work.
 
 ### Milestone 1 — Read-Only Inbox Review
 
@@ -573,11 +587,11 @@ reproducible workflow and its limits.
 
 ### Milestone 6 — History, Undo, and Release Hardening
 
-The proposed sixth milestone will focus on trustworthy recovery and a polished
-release. Likely work includes operation history, undo where filesystem
-semantics permit it, packaging, installation guidance, broader acceptance
-testing, and release hardening. The guarantees and limits of undo require a
-separate design before this scope is considered committed.
+The sixth milestone provides persisted audit History and reviewed, newest-record
+Undo for moves, renames, and Trash restoration. History can be deliberately
+cleared only through typed confirmation, and locking plus refresh checks prevent
+concurrent instances from silently trusting stale records. The remaining work is
+distribution-neutral release hardening and acceptance coverage.
 
 ## Verification
 
