@@ -412,7 +412,7 @@ fn render_history(frame: &mut Frame<'_>, app: &App) {
         lines.push(Line::default());
     }
     lines.push(Line::from(
-        "Enter Undo newest Move/Rename    Esc Inbox    q Quit",
+        "Enter Undo newest reversible action    Esc Inbox    q Quit",
     ));
     frame.render_widget(
         Paragraph::new(lines)

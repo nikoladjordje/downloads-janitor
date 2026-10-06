@@ -319,8 +319,11 @@ Fresh identity checks refuse a removed or replaced source; cancel and press
 After success, Inbox refreshes, clears the consumed mark, and highlights the
 entry near the previous index. A refresh error still reports **Sent to Trash**,
 removes the known-trashed row, and warns that other rows may be stale. Press `R`
-to retry the refresh. Recovery is through your file manager's Trash view;
-Downloads Janitor has no restore-from-Trash or undo command.
+to retry the refresh. Open History with `H` and press `Enter` to review restoring
+the newest Trash payload to its recorded original path. A separate `Enter`
+restores it only when the payload still has its recorded identity and the original
+path's parent is an available directory with no entry at that path. Restoration
+never overwrites, auto-renames, merges, or offers a different Destination.
 
 Storage follows the [freedesktop Trash specification](https://specifications.freedesktop.org/trash/latest/):
 `$XDG_DATA_HOME/Trash`, defaulting to `$HOME/.local/share/Trash` when the override
@@ -520,8 +523,9 @@ Explicit permanent deletion of a directory does recursively remove its contents.
 
 Milestones 1 through 5 are implemented and verified. Milestone 4 delivers
 efficient manual Inbox processing, Milestone 5 adds reviewable Configuration
-and Rules, and Milestone 6 begins with persisted History for completed moves
-and renames. Undo and release hardening remain upcoming Milestone 6 work.
+and Rules, and Milestone 6 adds persisted History plus reviewed undo for moves,
+renames, and Trash restoration. Further recovery controls and release hardening
+remain upcoming Milestone 6 work.
 
 ### Milestone 1 — Read-Only Inbox Review
 

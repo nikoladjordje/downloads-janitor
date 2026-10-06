@@ -78,8 +78,11 @@ impl HistoryRecord {
     pub fn reversed(&self) -> bool {
         self.reversed_at_ms.is_some()
     }
-    pub fn supports_rename_undo(&self) -> bool {
-        matches!(self.action, HistoryAction::Move | HistoryAction::Rename)
+    pub fn supports_undo(&self) -> bool {
+        matches!(
+            self.action,
+            HistoryAction::Move | HistoryAction::Rename | HistoryAction::Trash
+        )
     }
     pub(crate) fn identity(&self) -> SourceIdentity {
         self.identity

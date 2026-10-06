@@ -1769,7 +1769,7 @@ impl App {
             self.notice = Some("No reversible History record is available".into());
             return;
         };
-        if !record.supports_rename_undo() {
+        if !record.supports_undo() {
             self.notice = Some(format!(
                 "Newest reversible record is {}; its recovery is not available yet",
                 record.action().label()
@@ -4699,6 +4699,73 @@ mod tests {
         assert_eq!(record.source(), source);
         assert!(record.current().starts_with(home.join("Trash/files")));
         assert_eq!(fs::read(record.current()).unwrap(), b"keep");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn undo_preview_restores_the_newest_trash_payload_to_its_original_path() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-trash-undo-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        let source = downloads.join("keep.txt");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(&source, b"keep").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+        app.trash_root = home.join("Trash");
+
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Enter);
+        let payload = app.history_records().last().unwrap().current().to_owned();
+
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::UndoPreview);
+        assert!(app.undo_is_valid());
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::Inbox);
+        assert_eq!(fs::read(&source).unwrap(), b"keep");
+        assert!(!payload.exists());
+        assert!(app.history_records().last().unwrap().reversed());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn occupied_original_path_blocks_trash_restore_without_changing_the_payload() {
+        let home = std::env::temp_dir().join(format!(
+            "downloads-janitor-app-trash-undo-blocked-{}",
+            std::process::id()
+        ));
+        let downloads = home.join("Downloads");
+        let source = downloads.join("keep.txt");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        fs::write(&source, b"keep").unwrap();
+        let mut app = App::new(crate::inbox::scan_inbox(&downloads).unwrap(), home.clone());
+        app.trash_root = home.join("Trash");
+
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Enter);
+        let payload = app.history_records().last().unwrap().current().to_owned();
+        fs::write(&source, b"occupied").unwrap();
+
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen(), Screen::UndoPreview);
+        assert!(!app.undo_is_valid());
+        assert!(
+            app.undo_validation_error()
+                .unwrap()
+                .contains("already exists")
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(fs::read(&source).unwrap(), b"occupied");
+        assert_eq!(fs::read(&payload).unwrap(), b"keep");
+        assert!(!app.history_records().last().unwrap().reversed());
         fs::remove_dir_all(home).unwrap();
     }
 

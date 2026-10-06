@@ -6,9 +6,9 @@ use crate::{
 };
 
 pub fn validate(record: &HistoryRecord) -> Result<(), MoveError> {
-    if !record.supports_rename_undo() {
+    if !record.supports_undo() {
         return Err(MoveError::Validation(
-            "this action cannot be undone by a rename".to_owned(),
+            "this action cannot be undone".to_owned(),
         ));
     }
     let metadata = fs::symlink_metadata(record.current()).map_err(|error| match error.kind() {
