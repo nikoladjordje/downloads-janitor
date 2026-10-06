@@ -1,0 +1,49 @@
+name: Release source archive
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  source-archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify release commit
+        run: |
+          cargo fmt --check
+          cargo check --locked
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked
+      - name: Create source archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git archive \
+            --format=tar.gz \
+            --prefix="downloads-janitor-${RELEASE_TAG}/" \
+            --output="downloads-janitor-${RELEASE_TAG}-source.tar.gz" \
+            HEAD
+      - name: Build the published archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mkdir "$RUNNER_TEMP/downloads-janitor-release"
+          tar --extract \
+            --file="downloads-janitor-${RELEASE_TAG}-source.tar.gz" \
+            --directory="$RUNNER_TEMP/downloads-janitor-release"
+          cd "$RUNNER_TEMP/downloads-janitor-release/downloads-janitor-${RELEASE_TAG}"
+          cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: downloads-janitor-${{ github.ref_name }}-source
+          path: downloads-janitor-${{ github.ref_name }}-source.tar.gz
+          if-no-files-found: error
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: downloads-janitor-${{ github.ref_name }}-source.tar.gz

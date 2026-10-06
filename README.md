@@ -2,10 +2,11 @@
 
 Downloads Janitor is a keyboard-driven Linux terminal application for reviewing
 entries in `~/Downloads` and safely moving selected entries to a directory
-beneath `$HOME`. Milestones 1–5 provide reviewed same-filesystem moves without
+beneath `$HOME`. Milestones 1–6 provide reviewed same-filesystem moves without
 overwriting, individual renaming, selection and bulk actions, persistent
-ignore/restore, desktop Trash, typed confirmation for permanent deletion, and
-reviewable rule-based Destination suggestions.
+ignore/restore, desktop Trash, typed confirmation for permanent deletion,
+reviewable rule-based Destination suggestions, and persisted History with
+reviewed Undo.
 
 ## Requirements
 
@@ -24,6 +25,23 @@ From the repository root:
 cargo build
 cargo run
 ```
+
+## Install a release
+
+Each version tag publishes a distribution-neutral source archive named
+`downloads-janitor-<tag>-source.tar.gz`. Download the archive from that
+version's GitHub Release, then build from it with the included lockfile:
+
+```bash
+tar -xzf downloads-janitor-vX.Y.Z-source.tar.gz
+cd downloads-janitor-vX.Y.Z
+cargo build --release --locked
+install -Dm755 target/release/downloads-janitor "$HOME/.local/bin/downloads-janitor"
+```
+
+Ensure `$HOME/.local/bin` is on your `PATH`. This source artifact and the
+commands above are intentionally distribution-neutral; the project does not
+maintain distribution-specific packages.
 
 ## Workflow
 
@@ -535,11 +553,11 @@ Explicit permanent deletion of a directory does recursively remove its contents.
 
 ## Roadmap
 
-Milestones 1 through 5 are implemented and verified. Milestone 4 delivers
+Milestones 1 through 6 are implemented and verified. Milestone 4 delivers
 efficient manual Inbox processing, Milestone 5 adds reviewable Configuration
 and Rules, and Milestone 6 adds persisted History plus reviewed undo for moves,
-renames, and Trash restoration, explicit History clearing, and concurrent
-History-update protection. Release hardening remains upcoming Milestone 6 work.
+renames, and Trash restoration, explicit History clearing, concurrent
+History-update protection, and distribution-neutral release hardening.
 
 ### Milestone 1 — Read-Only Inbox Review
 
@@ -590,8 +608,9 @@ reproducible workflow and its limits.
 The sixth milestone provides persisted audit History and reviewed, newest-record
 Undo for moves, renames, and Trash restoration. History can be deliberately
 cleared only through typed confirmation, and locking plus refresh checks prevent
-concurrent instances from silently trusting stale records. The remaining work is
-distribution-neutral release hardening and acceptance coverage.
+concurrent instances from silently trusting stale records. The release workflow
+publishes a reproducible source archive without distribution-specific package
+maintenance.
 
 ## Verification
 
@@ -599,15 +618,16 @@ Run the reproducible automated checks from the repository root:
 
 ```bash
 cargo fmt --check
-cargo check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo check --locked
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
 ```
 
 For disposable terminal walkthroughs, fixture setup, and recorded results, see
-[Milestone 4 acceptance](docs/milestone-4-acceptance.md) and
-[Milestone 5 acceptance](docs/milestone-5-acceptance.md). The Milestone 5
-configuration and suggestion coverage can also be run by name:
+[Milestone 4 acceptance](docs/milestone-4-acceptance.md),
+[Milestone 5 acceptance](docs/milestone-5-acceptance.md), and
+[Milestone 6 release acceptance](docs/milestone-6-release-acceptance.md). The
+Milestone 5 configuration and suggestion coverage can also be run by name:
 
 ```bash
 cargo test configuration_manages_ordered_rules_that_reference_favorites
